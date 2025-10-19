@@ -21,33 +21,32 @@ let currentVolume = 100; // Default 100%
 // Music control functions
 async function play(streamUrl) {
     try {
-        await stop();
+        // KILL ALL MPV FIRST - ALWAYS!
+        await execAsync('pkill -9 mpv').catch(() => {});
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
         const urlToPlay = streamUrl || currentStreamUrl;
         if (!urlToPlay) {
             logger.warn('No stream URL available');
             return;
         }
+        
         currentStreamUrl = urlToPlay;
-        // Set volume to 100% by default or use saved volume
-        const minVol = -10239;
-        const maxVol = 400;
-        const volumeRaw = Math.round(minVol + (currentVolume / 100) * (maxVol - minVol));
-        logger.info({ currentVolume, volumeRaw, minVol: -10239, maxVol: 400 }, '🔊 Calculated volume');
+        const volumeRaw = Math.round((currentVolume / 100) * 65536);
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
         
-        // Kill all existing MPV first
-        await execAsync('pkill -9 mpv').catch(() => {});
-        await new Promise(resolve => setTimeout(resolve, 500));
-        
+        // Start ONE MPV
         await execAsync(`mpv --no-video --audio-device=alsa --really-quiet "${urlToPlay}" &`);
+        
         isPlaying = true;
         isPaused = false;
+        
         await firestore.collection('config').doc('devices').collection('list').doc(DEVICE_ID)
             .update({ status: 'playing', isPlaying: true, currentUrl: urlToPlay });
         await updateDeviceHeartbeat(firestore, DEVICE_ID, true, urlToPlay);
+        
         logger.info({ streamUrl: urlToPlay, volume: currentVolume }, '▶️ Music started');
-    }
-    catch (error) {
+    } catch (error) {
         logger.error({ error }, 'Failed to start music');
     }
 }
