@@ -202,8 +202,8 @@ const unsubscribe = commandsRef.where('deviceId', '==', DEVICE_ID).onSnapshot(as
 }, (error) => {
     logger.error({ error }, 'Commands listener error');
 });
-// Heartbeat every 10 seconds
-setInterval(async () => {
+// Heartbeat every 5 seconds
+setInterval(async () => { // 5 seconds
     try {
         const status = isPaused ? 'paused' : isPlaying ? 'playing' : 'online';
         await updateDeviceHeartbeat(firestore, DEVICE_ID, isPlaying, currentStreamUrl || '');
@@ -221,7 +221,7 @@ setInterval(async () => {
     catch (error) {
         logger.error({ error }, 'Heartbeat failed');
     }
-}, 10000);
+}, 5000);
 // Initialize with volume 100%
 setTimeout(async () => {
     await setVolume(100);
