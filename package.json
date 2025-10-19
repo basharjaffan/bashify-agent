@@ -1,23 +1,14 @@
 {
   "name": "bashify-agent",
   "version": "1.0.0",
-  "description": "Backend agent for Bashify Raspberry Pi devices",
-  "main": "dist/index.js",
   "type": "module",
+  "main": "dist/index.js",
   "scripts": {
-    "start": "node dist/index.js",
-    "dev": "node --watch dist/index.js",
-    "build": "tsc"
+    "start": "node dist/index.js"
   },
-  "keywords": ["bashify", "raspberry-pi", "music", "streaming"],
-  "author": "",
-  "license": "MIT",
   "dependencies": {
     "firebase-admin": "^12.0.0",
-    "dotenv": "^16.0.0"
-  },
-  "devDependencies": {
-    "@types/node": "^20.0.0",
-    "typescript": "^5.0.0"
+    "dotenv": "^16.0.0",
+    "pino": "^8.17.0"
   }
 }
