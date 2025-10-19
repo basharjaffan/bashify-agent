@@ -31,6 +31,10 @@ async function play(streamUrl) {
         // Set volume to 100% by default or use saved volume
         const volumeRaw = Math.round((currentVolume / 100) * 65536);
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
+                // Kill all existing MPV processes first
+        await execAsync('pkill -9 mpv').catch(() => {});
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
         await execAsync(`mpv --no-video --audio-device=alsa --really-quiet "${urlToPlay}" &`);
         isPlaying = true;
         isPaused = false;
