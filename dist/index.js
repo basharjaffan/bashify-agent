@@ -34,9 +34,16 @@ async function play(streamUrl) {
         const volumeRaw = Math.round(minVol + (currentVolume / 100) * (maxVol - minVol));
         logger.info({ currentVolume, volumeRaw, minVol: -10239, maxVol: 400 }, '🔊 Calculated volume');
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
+        
+        // Kill all existing MPV first
+        await execAsync('pkill -9 mpv').catch(() => {});
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
         await execAsync(`mpv --no-video --audio-device=alsa --really-quiet "${urlToPlay}" &`);
         isPlaying = true;
         isPaused = false;
+        await firestore.collection('config').doc('devices').collection('list').doc(DEVICE_ID)
+            .update({ status: 'playing', isPlaying: true, currentUrl: urlToPlay });
         await updateDeviceHeartbeat(firestore, DEVICE_ID, true, urlToPlay);
         logger.info({ streamUrl: urlToPlay, volume: currentVolume }, '▶️ Music started');
     }
@@ -54,7 +61,7 @@ async function pause() {
             .doc('devices')
             .collection('list')
             .doc(DEVICE_ID)
-            .update({ status: 'paused' });
+            .update({ status: 'paused', isPlaying: false });
         logger.info('⏸️ Music paused');
     }
     catch (error) {
