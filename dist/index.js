@@ -29,12 +29,11 @@ async function play(streamUrl) {
         }
         currentStreamUrl = urlToPlay;
         // Set volume to 100% by default or use saved volume
-        const volumeRaw = Math.round((currentVolume / 100) * 65536);
+        const minVol = -10239;
+        const maxVol = 400;
+        const volumeRaw = Math.round(minVol + (currentVolume / 100) * (maxVol - minVol));
+        logger.info({ currentVolume, volumeRaw, minVol: -10239, maxVol: 400 }, '🔊 Calculated volume');
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
-                // Kill all existing MPV processes first
-        await execAsync('pkill -9 mpv').catch(() => {});
-        await new Promise(resolve => setTimeout(resolve, 500));
-        
         await execAsync(`mpv --no-video --audio-device=alsa --really-quiet "${urlToPlay}" &`);
         isPlaying = true;
         isPaused = false;
@@ -93,8 +92,11 @@ async function stop() {
 }
 async function setVolume(volumePercent) {
     try {
+        logger.info({ volumePercent }, '🔊 setVolume called with value');
         currentVolume = Math.max(0, Math.min(100, volumePercent));
-        const volumeRaw = Math.round((currentVolume / 100) * 65536);
+        const minVol = -10239;
+        const maxVol = 400;
+        const volumeRaw = Math.round(minVol + (currentVolume / 100) * (maxVol - minVol));
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
         await firestore
             .collection('config')
