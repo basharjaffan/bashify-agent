@@ -1,9 +1,8 @@
 import { createHash } from 'crypto';
 import * as os from 'os';
 import { execSync } from 'child_process';
-import { FieldValue } from 'firebase-admin/firestore';
+import admin from 'firebase-admin';
 import { logger } from '../logger.js';
-
 export function getDeviceId() {
     const networkInterfaces = os.networkInterfaces();
     const mac = Object.values(networkInterfaces)
@@ -11,7 +10,6 @@ export function getDeviceId() {
         .find(i => i && !i.internal && i.mac !== '00:00:00:00:00:00')?.mac || 'unknown';
     return createHash('sha256').update(mac).digest('hex').substring(0, 16);
 }
-
 function getLocalIP() {
     const nets = os.networkInterfaces();
     const priority = ['wlan0', 'eth0'];
@@ -37,14 +35,12 @@ function getLocalIP() {
     }
     return 'unknown';
 }
-
 function getNetworkType() {
     const nets = os.networkInterfaces();
     const hasWifi = nets['wlan0']?.some(net => net.family === 'IPv4' && !net.internal) || false;
     const hasEthernet = nets['eth0']?.some(net => net.family === 'IPv4' && !net.internal) || false;
     return { wifi: hasWifi, ethernet: hasEthernet };
 }
-
 function getSystemMetrics() {
     try {
         const cpuUsage = os.loadavg()[0] * 100 / os.cpus().length;
@@ -71,11 +67,9 @@ function getSystemMetrics() {
         };
     }
 }
-
 function getUptime() {
     return os.uptime();
 }
-
 function getFirmwareVersion() {
     try {
         const version = execSync('git -C /home/dietpi/radio-revive rev-parse --short HEAD', { encoding: 'utf8' }).trim();
@@ -85,7 +79,6 @@ function getFirmwareVersion() {
         return 'unknown';
     }
 }
-
 export async function getGroupStreamUrl(firestore, deviceId) {
     try {
         const deviceDoc = await firestore
@@ -128,7 +121,6 @@ export async function getGroupStreamUrl(firestore, deviceId) {
         return null;
     }
 }
-
 export async function updateDeviceHeartbeat(firestore, deviceId, isPlaying = false, currentUrl = '') {
     try {
         const deviceRef = firestore
@@ -144,7 +136,7 @@ export async function updateDeviceHeartbeat(firestore, deviceId, isPlaying = fal
         const deviceSnap = await deviceRef.get();
         const existingData = deviceSnap.exists ? deviceSnap.data() : {};
         const updateData = {
-            lastSeen: FieldValue.serverTimestamp(),
+            lastSeen: admin.firestore.FieldValue.serverTimestamp(),
             ipAddress: ipAddress,
             status: isPlaying ? 'playing' : 'online',
             deviceId: deviceId,

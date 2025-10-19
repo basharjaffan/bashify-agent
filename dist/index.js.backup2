@@ -17,74 +17,33 @@ logger.info({ deviceId: DEVICE_ID }, '🚀 Radio Revive Agent starting...');
 let currentStreamUrl = null;
 let isPlaying = false;
 let isPaused = false;
-let currentVolume = 100;
-let isPlayLocked = false; // Default 100%
+let currentVolume = 100; // Default 100%
 // Music control functions
 async function play(streamUrl) {
     try {
-        // Prevent concurrent play() calls
-        if (isPlayLocked) {
-            logger.warn('Play already in progress, ignoring');
-            return;
-        }
-        isPlayLocked = true;
-        // Kill existing player first
-        if (playerProcess) {
-            playerProcess.kill('SIGKILL');
-            playerProcess = null;
-        }
-        await execAsync('pkill -9 mpv').catch(() => {});
-        await new Promise(resolve => setTimeout(resolve, 500));
-        
+        await stop();
         const urlToPlay = streamUrl || currentStreamUrl;
         if (!urlToPlay) {
             logger.warn('No stream URL available');
             return;
         }
-        
         currentStreamUrl = urlToPlay;
-        
-        // Set volume
-        const minVol = -10239;
-        const maxVol = 400;
-        const volumeRaw = Math.round(minVol + (currentVolume / 100) * (maxVol - minVol));
+        // Set volume to 100% by default or use saved volume
+        const volumeRaw = Math.round((currentVolume / 100) * 65536);
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
-        
-        // Start MPV with spawn (NOT background &)
-        playerProcess = spawn('mpv', [
-            '--no-video',
-            '--audio-device=alsa',
-            '--really-quiet',
-            urlToPlay
-        ]);
-        
-        playerProcess.on('error', (error) => {
-            logger.error({ error }, 'Failed to start player');
-            playerProcess = null;
-        });
-        
-        playerProcess.on('exit', (code) => {
-            logger.warn({ code }, 'Player exited');
-            playerProcess = null;
-        });
-        
+        await execAsync(`mpv --no-video --audio-device=alsa --really-quiet "${urlToPlay}" &`);
         isPlaying = true;
         isPaused = false;
-        
-        await firestore.collection('config').doc('devices').collection('list').doc(DEVICE_ID)
-            .update({ status: 'playing', isPlaying: true, currentUrl: urlToPlay });
         await updateDeviceHeartbeat(firestore, DEVICE_ID, true, urlToPlay);
-        
         logger.info({ streamUrl: urlToPlay, volume: currentVolume }, '▶️ Music started');
-        isPlayLocked = false;
-    } catch (error) {
+    }
+    catch (error) {
         logger.error({ error }, 'Failed to start music');
-        isPlayLocked = false;
     }
 }
 async function pause() {
     try {
-        await execAsync('killall -STOP mpv');
+        await execAsync('pkill -STOP mpv');
         isPaused = true;
         isPlaying = false;
         await firestore
@@ -92,7 +51,7 @@ async function pause() {
             .doc('devices')
             .collection('list')
             .doc(DEVICE_ID)
-            .update({ status: 'paused', isPlaying: false });
+            .set({ status: 'paused' }, { merge: true });
         logger.info('⏸️ Music paused');
     }
     catch (error) {
@@ -101,7 +60,7 @@ async function pause() {
 }
 async function resume() {
     try {
-        await execAsync('killall -CONT mpv');
+        await execAsync('pkill -CONT mpv');
         isPaused = false;
         isPlaying = true;
         await updateDeviceHeartbeat(firestore, DEVICE_ID, true, currentStreamUrl || '');
@@ -113,7 +72,7 @@ async function resume() {
 }
 async function stop() {
     try {
-        await execAsync('killall mpv');
+        await execAsync('pkill -9 mpv');
         isPlaying = false;
         isPaused = false;
         await firestore
@@ -121,7 +80,7 @@ async function stop() {
             .doc('devices')
             .collection('list')
             .doc(DEVICE_ID)
-            .update({ status: 'online' });
+            .set({ status: 'online' }, { merge: true });
         logger.info('⏹️ Music stopped');
     }
     catch (error) {
@@ -130,18 +89,15 @@ async function stop() {
 }
 async function setVolume(volumePercent) {
     try {
-        logger.info({ volumePercent }, '🔊 setVolume called with value');
         currentVolume = Math.max(0, Math.min(100, volumePercent));
-        const minVol = -10239;
-        const maxVol = 400;
-        const volumeRaw = Math.round(minVol + (currentVolume / 100) * (maxVol - minVol));
+        const volumeRaw = Math.round((currentVolume / 100) * 65536);
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
         await firestore
             .collection('config')
             .doc('devices')
             .collection('list')
             .doc(DEVICE_ID)
-            .update({ volume: currentVolume });
+            .set({ volume: currentVolume }, { merge: true });
         logger.info({ volume: currentVolume }, '🔊 Volume updated');
     }
     catch (error) {
