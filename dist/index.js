@@ -228,6 +228,28 @@ setTimeout(async () => {
     logger.info('✅ Initial volume set to 100%');
 }, 5000);
 logger.info('✅ Agent initialized');
+    // Auto-play music on startup if group has streamUrl
+    setTimeout(async () => {
+        try {
+            const groupDoc = await firestore
+                .collection('config')
+                .doc('groups')
+                .collection('list')
+                .doc('butik-musik')
+                .get();
+            
+            if (groupDoc.exists) {
+                const groupData = groupDoc.data();
+                if (groupData.streamUrl && !isPlaying) {
+                    logger.info({ url: groupData.streamUrl }, '🎵 Auto-starting music from group');
+                    await play(groupData.streamUrl);
+                }
+            }
+        } catch (error) {
+            logger.error({ error }, 'Failed to auto-start music');
+        }
+    }, 5000); // Wait 5 seconds after startup
+
 process.on('SIGTERM', () => {
     logger.info('👋 Shutting down...');
     unsubscribe();
