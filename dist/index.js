@@ -224,6 +224,7 @@ setTimeout(async () => {
 }, 5000);
 logger.info('✅ Agent initialized');
     
+    
     // Robust auto-play with retry mechanism
     let autoPlayAttempts = 0;
     const maxAutoPlayAttempts = 10;
@@ -238,20 +239,45 @@ logger.info('✅ Agent initialized');
                 throw new Error('Audio device not ready');
             });
             
+            // Get device to find its group
+            const deviceDoc = await firestore
+                .collection('config')
+                .doc('devices')
+                .collection('list')
+                .doc(DEVICE_ID)
+                .get();
+            
+            if (!deviceDoc.exists) {
+                throw new Error('Device not found');
+            }
+            
+            const deviceData = deviceDoc.data();
+            const groupId = deviceData.groupId;
+            
+            if (!groupId) {
+                logger.warn('Device has no group assigned');
+                return;
+            }
+            
+            // Get group streamUrl
             const groupDoc = await firestore
                 .collection('config')
                 .doc('groups')
                 .collection('list')
-                .doc('butik-musik')
+                .doc(groupId)
                 .get();
             
             if (groupDoc.exists) {
                 const groupData = groupDoc.data();
                 if (groupData.streamUrl && !isPlaying) {
-                    logger.info({ url: groupData.streamUrl }, '🎵 Auto-starting music from group');
+                    logger.info({ url: groupData.streamUrl, groupId }, '🎵 Auto-starting music from group');
                     await play(groupData.streamUrl);
                     logger.info('✅ Auto-play successful!');
+                } else {
+                    logger.warn({ groupId }, 'Group has no streamUrl');
                 }
+            } else {
+                logger.warn({ groupId }, 'Group not found');
             }
         } catch (error) {
             logger.error({ 
@@ -261,7 +287,7 @@ logger.info('✅ Agent initialized');
             }, 'Auto-play failed');
             
             if (autoPlayAttempts < maxAutoPlayAttempts) {
-                const delay = Math.min(5000 * autoPlayAttempts, 30000); // Max 30s
+                const delay = Math.min(5000 * autoPlayAttempts, 30000);
                 logger.info({ delay, nextAttempt: autoPlayAttempts + 1 }, 'Retrying auto-play...');
                 setTimeout(tryAutoPlay, delay);
             } else {
@@ -270,8 +296,8 @@ logger.info('✅ Agent initialized');
         }
     };
     
-    // Start first attempt after 10 seconds (give system time to boot)
     setTimeout(tryAutoPlay, 10000);
+
 
 
 process.on('SIGTERM', () => {
