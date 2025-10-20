@@ -28,17 +28,15 @@ async function play(streamUrl) {
             return;
         }
         isPlayLocked = true;
+        
         // Kill existing player first
-        if (playerProcess) {
-            playerProcess.kill('SIGKILL');
-            playerProcess = null;
-        }
         await execAsync('pkill -9 mpv').catch(() => {});
         await new Promise(resolve => setTimeout(resolve, 500));
         
         const urlToPlay = streamUrl || currentStreamUrl;
         if (!urlToPlay) {
             logger.warn('No stream URL available');
+            isPlayLocked = false;
             return;
         }
         
@@ -50,23 +48,19 @@ async function play(streamUrl) {
         const volumeRaw = Math.round(minVol + (currentVolume / 100) * (maxVol - minVol));
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
         
-        // Start MPV with spawn (NOT background &)
-        playerProcess = spawn('mpv', [
-            '--no-video',
-            '--audio-device=alsa',
-            '--really-quiet',
-            urlToPlay
-        ]);
+        // Start MPV with nohup (survives process exits)
+        await execAsync(`nohup mpv --no-video --audio-device=alsa --really-quiet "${urlToPlay}" > /dev/null 2>&1 &`);
         
-        playerProcess.on('error', (error) => {
-            logger.error({ error }, 'Failed to start player');
-            playerProcess = null;
-        });
+        // Wait to verify MPV started
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        const { stdout } = await execAsync('ps aux | grep mpv | grep -v grep | wc -l');
+        const mpvCount = parseInt(stdout.trim());
         
-        playerProcess.on('exit', (code) => {
-            logger.warn({ code }, 'Player exited');
-            playerProcess = null;
-        });
+        if (mpvCount === 0) {
+            throw new Error('MPV failed to start');
+        }
+        
+        logger.info({ mpvProcesses: mpvCount }, 'MPV verified running');
         
         isPlaying = true;
         isPaused = false;
@@ -80,6 +74,7 @@ async function play(streamUrl) {
     } catch (error) {
         logger.error({ error: error.message || error, stack: error.stack }, 'Failed to start music');
         isPlayLocked = false;
+        throw error;
     }
 }
 async function pause() {
