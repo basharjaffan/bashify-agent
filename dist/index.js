@@ -31,7 +31,15 @@ async function play(streamUrl) {
         
         // Kill existing player first
         await execAsync('pkill -9 mpv').catch(() => {});
-        await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        
+        // Verify MPV is dead
+        const { stdout: checkMpv } = await execAsync('ps aux | grep mpv | grep -v grep | wc -l').catch(() => ({ stdout: '0' }));
+        if (parseInt(checkMpv.trim()) > 0) {
+            logger.warn('MPV still running after kill, forcing again');
+            await execAsync('pkill -9 mpv').catch(() => {});
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
         
         const urlToPlay = streamUrl || currentStreamUrl;
         if (!urlToPlay) {
