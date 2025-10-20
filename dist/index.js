@@ -78,7 +78,7 @@ async function play(streamUrl) {
         logger.info({ streamUrl: urlToPlay, volume: currentVolume }, '▶️ Music started');
         isPlayLocked = false;
     } catch (error) {
-        logger.error({ error }, 'Failed to start music');
+        logger.error({ error: error.message || error, stack: error.stack }, 'Failed to start music');
         isPlayLocked = false;
     }
 }
@@ -228,9 +228,21 @@ setTimeout(async () => {
     logger.info('✅ Initial volume set to 100%');
 }, 5000);
 logger.info('✅ Agent initialized');
-    // Auto-play music on startup if group has streamUrl
-    setTimeout(async () => {
+    
+    // Robust auto-play with retry mechanism
+    let autoPlayAttempts = 0;
+    const maxAutoPlayAttempts = 10;
+    
+    const tryAutoPlay = async () => {
         try {
+            autoPlayAttempts++;
+            logger.info({ attempt: autoPlayAttempts }, 'Attempting auto-play...');
+            
+            // Wait for audio device to be ready
+            await execAsync('amixer get PCM').catch(() => {
+                throw new Error('Audio device not ready');
+            });
+            
             const groupDoc = await firestore
                 .collection('config')
                 .doc('groups')
@@ -243,12 +255,29 @@ logger.info('✅ Agent initialized');
                 if (groupData.streamUrl && !isPlaying) {
                     logger.info({ url: groupData.streamUrl }, '🎵 Auto-starting music from group');
                     await play(groupData.streamUrl);
+                    logger.info('✅ Auto-play successful!');
                 }
             }
         } catch (error) {
-            logger.error({ error }, 'Failed to auto-start music');
+            logger.error({ 
+                error: error.message || error, 
+                attempt: autoPlayAttempts,
+                maxAttempts: maxAutoPlayAttempts 
+            }, 'Auto-play failed');
+            
+            if (autoPlayAttempts < maxAutoPlayAttempts) {
+                const delay = Math.min(5000 * autoPlayAttempts, 30000); // Max 30s
+                logger.info({ delay, nextAttempt: autoPlayAttempts + 1 }, 'Retrying auto-play...');
+                setTimeout(tryAutoPlay, delay);
+            } else {
+                logger.error('❌ Auto-play failed after max attempts');
+            }
         }
-    }, 5000); // Wait 5 seconds after startup
+    };
+    
+    // Start first attempt after 10 seconds (give system time to boot)
+    setTimeout(tryAutoPlay, 10000);
+
 
 process.on('SIGTERM', () => {
     logger.info('👋 Shutting down...');
