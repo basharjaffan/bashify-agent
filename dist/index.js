@@ -138,19 +138,35 @@ async function resume() {
 }
 async function stop() {
     try {
-        await execAsync('killall mpv');
+        // Kill MPV immediately and forcefully
+        await execAsync('pkill -9 mpv').catch(() => {});
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // Verify all MPV are dead
+        const { stdout } = await execAsync('ps aux | grep mpv | grep -v grep | wc -l').catch(() => ({ stdout: '0' }));
+        const mpvCount = parseInt(stdout.trim());
+        
+        if (mpvCount > 0) {
+            logger.warn({ mpvCount }, 'MPV still running after stop, forcing again');
+            await execAsync('pkill -9 mpv').catch(() => {});
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        
         isPlaying = false;
         isPaused = false;
+        currentStreamUrl = '';
+        
         await firestore
             .collection('config')
             .doc('devices')
             .collection('list')
             .doc(DEVICE_ID)
-            .update({ status: 'online' });
+            .update({ status: 'stopped', isPlaying: false });
+        
         logger.info('⏹️ Music stopped');
     }
     catch (error) {
-        // Ignore if mpv not running
+        logger.error({ error }, 'Failed to stop');
     }
 }
 async function setVolume(volumePercent) {
