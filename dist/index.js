@@ -423,6 +423,8 @@ logger.info('✅ Agent initialized');
                     logger.info({ url: groupData.streamUrl, groupId }, '🎵 Auto-starting music from group');
                     await play(groupData.streamUrl);
                     logger.info('✅ Auto-play successful!');
+                    // Start announcement scheduler for this group
+                    startAnnouncementScheduler(groupData);
                 } else {
                     logger.warn({ groupId }, 'Group has no streamUrl');
                 }
