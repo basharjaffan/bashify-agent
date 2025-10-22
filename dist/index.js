@@ -140,7 +140,7 @@ async function stop() {
     try {
         // Kill MPV immediately and forcefully
         await execAsync('pkill -9 mpv').catch(() => {});
-        await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, 1000));
         
         // Verify all MPV are dead
         const { stdout } = await execAsync('ps aux | grep mpv | grep -v grep | wc -l').catch(() => ({ stdout: '0' }));
@@ -149,7 +149,7 @@ async function stop() {
         if (mpvCount > 0) {
             logger.warn({ mpvCount }, 'MPV still running after stop, forcing again');
             await execAsync('pkill -9 mpv').catch(() => {});
-            await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, 1000));
         }
         
         isPlaying = false;
