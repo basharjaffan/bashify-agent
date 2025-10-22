@@ -75,7 +75,8 @@ async function play(streamUrl) {
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
         
         // Start MPV and capture PID
-        const mpvCmd = `/usr/local/bin/bashify-mpv-start "${urlToPlay}" >/dev/null 2>&1 & echo $!`;
+        // Start MPV with IPC socket for volume control
+        const mpvCmd = `mpv --no-video --audio-device=alsa --really-quiet --input-ipc-server=/tmp/mpv-socket "${urlToPlay}"` >/dev/null 2>&1 & echo $!`;
         const { stdout: pidOutput } = await execAsync(mpvCmd);
         const mpvPid = pidOutput.trim();
         
@@ -121,12 +122,13 @@ let currentGroup = null;
 async function fadeVolume(targetPercent, durationMs = 2000) {
     const steps = 20;
     const stepDelay = durationMs / steps;
-    const startVol = currentVolume;
+    const startVol = 100; // MPV always starts at 100%
     const diff = targetPercent - startVol;
     
     for (let i = 1; i <= steps; i++) {
         const newVol = Math.round(startVol + (diff * i / steps));
-        await setVolume(newVol);
+        // Control MPV volume via echo to IPC socket
+        await execAsync(`echo '{ "command": ["set_property", "volume", ${newVol}] }' | socat - /tmp/mpv-socket`).catch(() => {});
         await new Promise(resolve => setTimeout(resolve, stepDelay));
     }
 }
@@ -138,7 +140,7 @@ async function playAnnouncement(announcementUrl) {
         const originalVolume = currentVolume;
         
         // Fade music down to 20%
-        await fadeVolume(20, 1500);
+        await fadeVolume(50, 1500);
         
         // Play announcement at full volume in separate process
         await execAsync(`mpv --no-video --audio-device=alsa --volume=100 "${announcementUrl}"`);
