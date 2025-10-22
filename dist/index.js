@@ -29,6 +29,14 @@ async function play(streamUrl) {
         }
         isPlayLocked = true;
         
+        // CRITICAL: Check if MPV already running BEFORE killing
+        const { stdout: checkBefore } = await execAsync('ps aux | grep mpv | grep -v grep | wc -l').catch(() => ({ stdout: '0' }));
+        const mpvCountBefore = parseInt(checkBefore.trim());
+        
+        if (mpvCountBefore > 0) {
+            logger.info({ mpvCount: mpvCountBefore }, 'Killing existing MPV processes');
+        }
+        
         // Kill existing player first
         await execAsync('pkill -9 mpv').catch(() => {});
         await new Promise(resolve => setTimeout(resolve, 1500));
@@ -39,6 +47,14 @@ async function play(streamUrl) {
             logger.warn('MPV still running after kill, forcing again');
             await execAsync('pkill -9 mpv').catch(() => {});
             await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        
+        // CRITICAL: Double-check no MPV before starting
+        const { stdout: finalCheck } = await execAsync('ps aux | grep mpv | grep -v grep | wc -l').catch(() => ({ stdout: '0' }));
+        if (parseInt(finalCheck.trim()) > 0) {
+            logger.error('Failed to kill all MPV, aborting play');
+            isPlayLocked = false;
+            return;
         }
         
         const urlToPlay = streamUrl || currentStreamUrl;
@@ -56,16 +72,20 @@ async function play(streamUrl) {
         const volumeRaw = Math.round(minVol + (currentVolume / 100) * (maxVol - minVol));
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
         
-        // Start MPV with nohup (survives process exits)
+        // Start MPV with nohup
         await execAsync(`nohup mpv --no-video --audio-device=alsa --really-quiet "${urlToPlay}" > /dev/null 2>&1 &`);
         
         // Wait to verify MPV started
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise(resolve => setTimeout(resolve, 2000));
         const { stdout } = await execAsync('ps aux | grep mpv | grep -v grep | wc -l');
         const mpvCount = parseInt(stdout.trim());
         
         if (mpvCount === 0) {
             throw new Error('MPV failed to start');
+        }
+        
+        if (mpvCount > 1) {
+            logger.error({ mpvCount }, 'WARNING: Multiple MPV detected after start!');
         }
         
         logger.info({ mpvProcesses: mpvCount }, 'MPV verified running');
