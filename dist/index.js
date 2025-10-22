@@ -113,6 +113,94 @@ async function play(streamUrl) {
         throw error;
     }
 }
+
+// Announcement system with fade
+let announcementTimer = null;
+let currentGroup = null;
+
+async function fadeVolume(targetPercent, durationMs = 2000) {
+    const steps = 20;
+    const stepDelay = durationMs / steps;
+    const startVol = currentVolume;
+    const diff = targetPercent - startVol;
+    
+    for (let i = 1; i <= steps; i++) {
+        const newVol = Math.round(startVol + (diff * i / steps));
+        await setVolume(newVol);
+        await new Promise(resolve => setTimeout(resolve, stepDelay));
+    }
+}
+
+async function playAnnouncement(announcementUrl) {
+    try {
+        logger.info({ url: announcementUrl }, '📢 Playing announcement with fade');
+        
+        const originalVolume = currentVolume;
+        
+        // Fade music down to 20%
+        await fadeVolume(20, 1500);
+        
+        // Play announcement at full volume in separate process
+        await execAsync(`mpv --no-video --audio-device=alsa --volume=100 "${announcementUrl}"`);
+        
+        // Fade music back up
+        await fadeVolume(originalVolume, 1500);
+        
+        logger.info('✅ Announcement completed');
+    } catch (error) {
+        logger.error({ error }, 'Failed to play announcement');
+        // Restore volume even if announcement fails
+        await setVolume(currentVolume);
+    }
+}
+
+function startAnnouncementScheduler(group) {
+    // Clear existing timer
+    if (announcementTimer) {
+        clearInterval(announcementTimer);
+    }
+    
+    currentGroup = group;
+    
+    // Check if group has announcements
+    if (!group.announcements || group.announcements.length === 0) {
+        logger.info('No announcements configured for this group');
+        return;
+    }
+    
+    const intervalMinutes = group.announcementInterval || 15;
+    const intervalMs = intervalMinutes * 60 * 1000;
+    
+    logger.info({ 
+        count: group.announcements.length, 
+        interval: intervalMinutes 
+    }, '🔔 Starting announcement scheduler');
+    
+    let announcementIndex = 0;
+    
+    // Play announcement immediately on group change (optional)
+    // playAnnouncement(group.announcements[0].url);
+    
+    // Schedule periodic announcements
+    announcementTimer = setInterval(async () => {
+        if (isPlaying && !isPaused && group.announcements) {
+            const announcement = group.announcements[announcementIndex];
+            await playAnnouncement(announcement.url);
+            
+            // Move to next announcement (round-robin)
+            announcementIndex = (announcementIndex + 1) % group.announcements.length;
+        }
+    }, intervalMs);
+}
+
+function stopAnnouncementScheduler() {
+    if (announcementTimer) {
+        clearInterval(announcementTimer);
+        announcementTimer = null;
+        logger.info('🔕 Announcement scheduler stopped');
+    }
+}
+
 async function pause() {
     try {
         await execAsync('killall -STOP mpv');
@@ -169,6 +257,7 @@ async function stop() {
             .doc(DEVICE_ID)
             .update({ status: 'stopped', isPlaying: false });
         
+        stopAnnouncementScheduler();
         logger.info('⏹️ Music stopped');
     }
     catch (error) {
