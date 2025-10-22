@@ -75,7 +75,7 @@ async function play(streamUrl) {
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
         
         // Start MPV and capture PID
-        const mpvCmd = `setsid mpv --no-video --audio-device=alsa --really-quiet "${urlToPlay}" </dev/null >/dev/null 2>&1 & echo $!`;
+        const mpvCmd = `/usr/local/bin/bashify-mpv-start "${urlToPlay}" >/dev/null 2>&1 & echo $!`;
         const { stdout: pidOutput } = await execAsync(mpvCmd);
         const mpvPid = pidOutput.trim();
         
