@@ -188,9 +188,18 @@ const unsubscribe = commandsRef.where('deviceId', '==', DEVICE_ID).onSnapshot(as
             try {
                 switch (commandData.action) {
                     case 'play':
-                        await play(commandData.streamUrl);
+                        // If paused, resume instead of starting new MPV
+                        if (isPaused) {
+                            await resume();
+                        } else {
+                            await play(commandData.streamUrl);
+                        }
                         break;
                     case 'pause':
+                        if (!isPaused) {
+                            await pause();
+                        }
+                        break;
                         if (isPaused) {
                             await resume();
                         }
