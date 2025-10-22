@@ -73,7 +73,9 @@ async function play(streamUrl) {
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
         
         // Start MPV with nohup
-        await execAsync(`nohup mpv --no-video --audio-device=alsa --really-quiet "${urlToPlay}" > /dev/null 2>&1 &`);
+        // Start MPV with setsid to prevent double-fork
+        const mpvCmd = `setsid mpv --no-video --audio-device=alsa --really-quiet "${urlToPlay}" </dev/null >/dev/null 2>&1 &`;
+        await execAsync(mpvCmd);
         
         // Wait to verify MPV started
         await new Promise(resolve => setTimeout(resolve, 2000));
