@@ -76,7 +76,7 @@ async function play(streamUrl) {
         
         // Start MPV and capture PID
         // Start MPV with IPC socket for volume control
-        const mpvCmd = `mpv --no-video --audio-device=alsa --really-quiet --input-ipc-server=/tmp/mpv-socket "${urlToPlay}"` >/dev/null 2>&1 & echo $!`;
+        const mpvCmd = `mpv --no-video --audio-device=alsa --really-quiet --input-ipc-server=/tmp/mpv-socket "${urlToPlay}" >/dev/null 2>&1 & echo $!`;
         const { stdout: pidOutput } = await execAsync(mpvCmd);
         const mpvPid = pidOutput.trim();
         
