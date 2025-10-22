@@ -29,15 +29,17 @@ async function play(streamUrl) {
         }
         isPlayLocked = true;
         
-        // CRITICAL: Check if MPV already running BEFORE killing
-        const { stdout: checkBefore } = await execAsync('ps aux | grep mpv | grep -v grep | wc -l').catch(() => ({ stdout: '0' }));
-        const mpvCountBefore = parseInt(checkBefore.trim());
+        // CRITICAL: Check PID lock file
+        const pidFile = '/tmp/bashify-mpv.lock';
+        try {
+            const existingPid = await execAsync('cat ' + pidFile).then(r => r.stdout.trim()).catch(() => null);
+            if (existingPid) {
+                logger.warn({ existingPid }, 'MPV lock file exists, killing old process');
+                await execAsync('kill -9 ' + existingPid).catch(() => {});
+            }
+        } catch (e) {}
         
-        if (mpvCountBefore > 0) {
-            logger.info({ mpvCount: mpvCountBefore }, 'Killing existing MPV processes');
-        }
-        
-        // Kill existing player first
+        // Kill ALL existing MPV
         await execAsync('pkill -9 mpv').catch(() => {});
         await new Promise(resolve => setTimeout(resolve, 1500));
         
@@ -72,10 +74,14 @@ async function play(streamUrl) {
         const volumeRaw = Math.round(minVol + (currentVolume / 100) * (maxVol - minVol));
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
         
-        // Start MPV with nohup
-        // Start MPV with setsid to prevent double-fork
-        const mpvCmd = `setsid mpv --no-video --audio-device=alsa --really-quiet "${urlToPlay}" </dev/null >/dev/null 2>&1 &`;
-        await execAsync(mpvCmd);
+        // Start MPV and capture PID
+        const mpvCmd = `setsid mpv --no-video --audio-device=alsa --really-quiet "${urlToPlay}" </dev/null >/dev/null 2>&1 & echo $!`;
+        const { stdout: pidOutput } = await execAsync(mpvCmd);
+        const mpvPid = pidOutput.trim();
+        
+        // Save PID to lock file
+        await execAsync(`echo ${mpvPid} > ${pidFile}`);
+        logger.info({ mpvPid }, 'MPV started with PID');
         
         // Wait to verify MPV started
         await new Promise(resolve => setTimeout(resolve, 2000));
