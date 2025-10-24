@@ -1,462 +1,287 @@
-import { initializeApp, cert } from 'firebase-admin/app';
-import { getFirestore } from 'firebase-admin/firestore';
-import { exec } from 'child_process';
+import { spawn, exec } from 'child_process';
 import { promisify } from 'util';
-import { readFileSync } from 'fs';
 import { logger } from './logger.js';
+import { initializeFirebase, getFirestore } from './config/firebase.js';
 import { getDeviceId, updateDeviceHeartbeat } from './config/loader.js';
 const execAsync = promisify(exec);
-// Read service account JSON
-const serviceAccount = JSON.parse(readFileSync('/home/dietpi/radio-revive/rpi-agent/service-account.json', 'utf8'));
-initializeApp({
-    credential: cert(serviceAccount),
-});
-const firestore = getFirestore();
-const DEVICE_ID = getDeviceId();
-logger.info({ deviceId: DEVICE_ID }, '🚀 Radio Revive Agent starting...');
-let currentStreamUrl = null;
-let isPlaying = false;
-let isPaused = false;
-let currentVolume = 100;
-let isPlayLocked = false; // Default 100%
-// Music control functions
-async function play(streamUrl) {
-    try {
-        // Prevent concurrent play() calls
-        if (isPlayLocked) {
-            logger.warn('Play already in progress, ignoring');
-            return;
-        }
-        isPlayLocked = true;
-        
-        // CRITICAL: Check PID lock file
-        const pidFile = '/tmp/bashify-mpv.lock';
-        try {
-            const existingPid = await execAsync('cat ' + pidFile).then(r => r.stdout.trim()).catch(() => null);
-            if (existingPid) {
-                logger.warn({ existingPid }, 'MPV lock file exists, killing old process');
-                await execAsync('kill -9 ' + existingPid).catch(() => {});
-            }
-        } catch (e) {}
-        
-        // Kill ALL existing MPV
-        await execAsync('pkill -9 mpv').catch(() => {});
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        
-        // Verify MPV is dead
-        const { stdout: checkMpv } = await execAsync('ps aux | grep mpv | grep -v grep | wc -l').catch(() => ({ stdout: '0' }));
-        if (parseInt(checkMpv.trim()) > 0) {
-            logger.warn('MPV still running after kill, forcing again');
-            await execAsync('pkill -9 mpv').catch(() => {});
-            await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-        
-        // CRITICAL: Double-check no MPV before starting
-        const { stdout: finalCheck } = await execAsync('ps aux | grep mpv | grep -v grep | wc -l').catch(() => ({ stdout: '0' }));
-        if (parseInt(finalCheck.trim()) > 0) {
-            logger.error('Failed to kill all MPV, aborting play');
-            isPlayLocked = false;
-            return;
-        }
-        
-        const urlToPlay = streamUrl || currentStreamUrl;
-        if (!urlToPlay) {
-            logger.warn('No stream URL available');
-            isPlayLocked = false;
-            return;
-        }
-        
-        currentStreamUrl = urlToPlay;
-        
-        // Set volume
-        const minVol = -10239;
-        const maxVol = 400;
-        const volumeRaw = Math.round(minVol + (currentVolume / 100) * (maxVol - minVol));
-        await execAsync(`amixer set PCM -- ${volumeRaw}`);
-        
-        // Start MPV and capture PID
-        // Start MPV with IPC socket for volume control
-        const mpvCmd = `mpv --no-video --audio-device=alsa --really-quiet --input-ipc-server=/tmp/mpv-socket "${urlToPlay}" >/dev/null 2>&1 & echo $!`;
-        const { stdout: pidOutput } = await execAsync(mpvCmd);
-        const mpvPid = pidOutput.trim();
-        
-        // Save PID to lock file
-        await execAsync(`echo ${mpvPid} > ${pidFile}`);
-        logger.info({ mpvPid }, 'MPV started with PID');
-        
-        // Wait to verify MPV started
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        const { stdout } = await execAsync('ps aux | grep mpv | grep -v grep | wc -l');
-        const mpvCount = parseInt(stdout.trim());
-        
-        if (mpvCount === 0) {
-            throw new Error('MPV failed to start');
-        }
-        
-        if (mpvCount > 1) {
-            logger.error({ mpvCount }, 'WARNING: Multiple MPV detected after start!');
-        }
-        
-        logger.info({ mpvProcesses: mpvCount }, 'MPV verified running');
-        
-        isPlaying = true;
-        isPaused = false;
-        
-        await firestore.collection('config').doc('devices').collection('list').doc(DEVICE_ID)
-            .update({ status: 'playing', isPlaying: true, currentUrl: urlToPlay });
-        await updateDeviceHeartbeat(firestore, DEVICE_ID, true, urlToPlay);
-        
-        logger.info({ streamUrl: urlToPlay, volume: currentVolume }, '▶️ Music started');
-        isPlayLocked = false;
-    } catch (error) {
-        logger.error({ error: error.message || error, stack: error.stack }, 'Failed to start music');
-        isPlayLocked = false;
-        throw error;
-    }
-}
-
-// Announcement system with fade
-let announcementTimer = null;
-let currentGroup = null;
-
-async function fadeVolume(targetPercent, durationMs = 2000) {
-    const steps = 20;
-    const stepDelay = durationMs / steps;
-    const startVol = 100; // MPV always starts at 100%
-    const diff = targetPercent - startVol;
-    
-    for (let i = 1; i <= steps; i++) {
-        const newVol = Math.round(startVol + (diff * i / steps));
-        // Control MPV volume via echo to IPC socket
-        await execAsync(`echo '{ "command": ["set_property", "volume", ${newVol}] }' | socat - /tmp/mpv-socket`).catch(() => {});
-        await new Promise(resolve => setTimeout(resolve, stepDelay));
-    }
-}
-
-async function playAnnouncement(announcementUrl) {
-    try {
-        logger.info({ url: announcementUrl }, '📢 Playing announcement with fade');
-        
-        const originalVolume = currentVolume;
-        
-        // Fade music down to 20%
-        await fadeVolume(50, 1500);
-        
-        // Play announcement at full volume in separate process
-        await execAsync(`mpv --no-video --audio-device=alsa --volume=100 "${announcementUrl}"`);
-        
-        // Fade music back up
-        await fadeVolume(originalVolume, 1500);
-        
-        logger.info('✅ Announcement completed');
-    } catch (error) {
-        logger.error({ error }, 'Failed to play announcement');
-        // Restore volume even if announcement fails
-        await setVolume(currentVolume);
-    }
-}
-
-function startAnnouncementScheduler(group) {
-    // Clear existing timer
-    if (announcementTimer) {
-        clearInterval(announcementTimer);
-    }
-    
-    currentGroup = group;
-    
-    // Check if group has announcements
-    if (!group.announcements || group.announcements.length === 0) {
-        logger.info('No announcements configured for this group');
+const ORGANIZATION_ID = process.env.ORGANIZATION_ID || 'bashify';
+let playerProcess = null;
+let currentUrl = null;
+let isPlayingLocked = false;
+let hasStartedInitially = false;
+const startTime = Date.now();
+let firestore;
+let deviceId;
+async function playStream(url) {
+    if (isPlayingLocked) {
+        logger.warn('Play command ignored - already starting stream');
         return;
     }
-    
-    const intervalMinutes = group.announcementInterval || 15;
-    const intervalMs = intervalMinutes * 60 * 1000;
-    
-    logger.info({ 
-        count: group.announcements.length, 
-        interval: intervalMinutes 
-    }, '🔔 Starting announcement scheduler');
-    
-    let announcementIndex = 0;
-    
-    // Play announcement immediately on group change (optional)
-    // playAnnouncement(group.announcements[0].url);
-    
-    // Schedule periodic announcements
-    announcementTimer = setInterval(async () => {
-        if (isPlaying && !isPaused && group.announcements) {
-            const announcement = group.announcements[announcementIndex];
-            await playAnnouncement(announcement.url);
-            
-            // Move to next announcement (round-robin)
-            announcementIndex = (announcementIndex + 1) % group.announcements.length;
+    if (!url) {
+        logger.warn('Cannot play - no URL provided');
+        return;
+    }
+    if (playerProcess && currentUrl === url) {
+        logger.info({ url }, '✅ Already playing this stream, no restart needed');
+        return;
+    }
+    isPlayingLocked = true;
+    if (playerProcess && currentUrl !== url) {
+        try {
+            logger.info({ oldUrl: currentUrl, newUrl: url }, '🔄 Switching to different stream...');
+            playerProcess.kill('SIGKILL');
+            playerProcess = null;
+            try {
+                await execAsync('pkill -9 mpv');
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+            catch (e) { }
         }
-    }, intervalMs);
-}
-
-function stopAnnouncementScheduler() {
-    if (announcementTimer) {
-        clearInterval(announcementTimer);
-        announcementTimer = null;
-        logger.info('🔕 Announcement scheduler stopped');
-    }
-}
-
-async function pause() {
-    try {
-        await execAsync('killall -STOP mpv');
-        isPaused = true;
-        isPlaying = false;
-        await firestore
-            .collection('config')
-            .doc('devices')
-            .collection('list')
-            .doc(DEVICE_ID)
-            .update({ status: 'paused', isPlaying: false });
-        logger.info('⏸️ Music paused');
-    }
-    catch (error) {
-        logger.error({ error }, 'Failed to pause');
-    }
-}
-async function resume() {
-    try {
-        await execAsync('killall -CONT mpv');
-        isPaused = false;
-        isPlaying = true;
-        await updateDeviceHeartbeat(firestore, DEVICE_ID, true, currentStreamUrl || '');
-        logger.info('▶️ Music resumed');
-    }
-    catch (error) {
-        logger.error({ error }, 'Failed to resume');
-    }
-}
-async function stop() {
-    try {
-        // Kill MPV immediately and forcefully
-        await execAsync('pkill -9 mpv').catch(() => {});
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        // Verify all MPV are dead
-        const { stdout } = await execAsync('ps aux | grep mpv | grep -v grep | wc -l').catch(() => ({ stdout: '0' }));
-        const mpvCount = parseInt(stdout.trim());
-        
-        if (mpvCount > 0) {
-            logger.warn({ mpvCount }, 'MPV still running after stop, forcing again');
-            await execAsync('pkill -9 mpv').catch(() => {});
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        catch (e) {
+            logger.error({ error: e }, 'Error killing existing process');
         }
-        
-        isPlaying = false;
-        isPaused = false;
-        currentStreamUrl = '';
-        
-        await firestore
-            .collection('config')
-            .doc('devices')
-            .collection('list')
-            .doc(DEVICE_ID)
-            .update({ status: 'stopped', isPlaying: false });
-        
-        stopAnnouncementScheduler();
-        logger.info('⏹️ Music stopped');
     }
-    catch (error) {
-        logger.error({ error }, 'Failed to stop');
-    }
+    currentUrl = url;
+    logger.info({ url }, '🎵 Starting music...');
+    playerProcess = spawn('mpv', [
+        '--no-video',
+        '--audio-device=alsa',
+        '--really-quiet',
+        url
+    ]);
+    playerProcess.on('error', (error) => {
+        logger.error({ error }, '❌ Failed to start player');
+        playerProcess = null;
+        isPlayingLocked = false;
+    });
+    playerProcess.on('spawn', () => {
+        logger.info({ pid: playerProcess.pid }, '✅ Music started successfully!');
+        isPlayingLocked = false;
+    });
+    playerProcess.on('exit', (code) => {
+        logger.warn({ code }, '⏹️ Player stopped');
+        playerProcess = null;
+        isPlayingLocked = false;
+    });
 }
-async function setVolume(volumePercent) {
+function stopStream() {
+    if (playerProcess) {
+        logger.info({ pid: playerProcess.pid }, '⏹️ Stopping stream...');
+        playerProcess.kill('SIGKILL');
+        playerProcess = null;
+    }
+    logger.info('⏹️ Stream stop command sent');
+}
+async function setVolume(percent) {
+    const rawValue = Math.round((percent / 100) * 400 - 10239);
     try {
-        logger.info({ volumePercent }, '🔊 setVolume called with value');
-        currentVolume = Math.max(0, Math.min(100, volumePercent));
-        const minVol = -10239;
-        const maxVol = 400;
-        const volumeRaw = Math.round(minVol + (currentVolume / 100) * (maxVol - minVol));
-        await execAsync(`amixer set PCM -- ${volumeRaw}`);
-        await firestore
-            .collection('config')
-            .doc('devices')
-            .collection('list')
-            .doc(DEVICE_ID)
-            .update({ volume: currentVolume });
-        logger.info({ volume: currentVolume }, '🔊 Volume updated');
+        await execAsync(`amixer set PCM -- ${rawValue}`);
+        logger.info({ percent, rawValue }, '🔊 Volume updated');
     }
     catch (error) {
         logger.error({ error }, 'Failed to set volume');
     }
 }
-// Listen for commands
-const commandsRef = firestore
-    .collection('config')
-    .doc('commands')
-    .collection('list');
-const unsubscribe = commandsRef.where('deviceId', '==', DEVICE_ID).onSnapshot(async (snapshot) => {
-    for (const change of snapshot.docChanges()) {
-        if (change.type === 'added') {
-            const commandData = change.doc.data();
-            if (commandData.processed)
-                continue;
-            logger.info({ command: commandData }, '📨 Command received');
-            try {
-                switch (commandData.action) {
-                    case 'play':
-                        // If paused, resume instead of starting new MPV
-                        if (isPaused) {
-                            await resume();
-                        } else {
-                            await play(commandData.streamUrl);
-                        }
-                        break;
-                    case 'pause':
-                        if (!isPaused) {
-                            await pause();
-                        }
-                        break;
-                        if (isPaused) {
-                            await resume();
-                        }
-                        else {
-                            await pause();
-                        }
-                        break;
-                    case 'stop':
-                        await stop();
-                        break;
-                    case 'volume':
-                        await setVolume(commandData.volume || 100);
-                        break;
-                    case 'system_update':
-                        logger.info('🔄 System update requested');
-                        exec('bash /home/dietpi/radio-revive/rpi-agent/scripts/system-update.sh');
-                        break;
-                    case 'configure_wifi':
-                    case 'network_config':
-                        logger.info({ ip: commandData.ipAddress, gateway: commandData.gateway }, '🌐 Network config requested');
-                        exec(`sudo bash /home/dietpi/radio-revive/rpi-agent/scripts/configure-network.sh "${commandData.ipAddress}" "${commandData.gateway}" "${commandData.dns1}" "${commandData.dns2}" "${commandData.interface || 'eth0'}"`);
-                        break;
-                        logger.info({ ssid: commandData.ssid }, '📶 WiFi config requested');
-                        exec(`bash /home/dietpi/radio-revive/rpi-agent/scripts/configure-wifi.sh "${commandData.ssid}" "${commandData.password}"`);
-                        break;
-                }
-                await commandsRef.doc(change.doc.id).update({ processed: true });
-            }
-            catch (error) {
-                logger.error({ error }, 'Command execution failed');
-            }
-        }
-    }
-}, (error) => {
-    logger.error({ error }, 'Commands listener error');
-});
-// Heartbeat every 5 seconds
-setInterval(async () => { // 5 seconds
+async function updateProgress(deviceId, action, progress, status, currentStep) {
     try {
-        const status = isPaused ? 'paused' : isPlaying ? 'playing' : 'online';
-        await updateDeviceHeartbeat(firestore, DEVICE_ID, isPlaying, currentStreamUrl || '');
-        // Update with current status and volume
-        await firestore
+        const progressRef = firestore
             .collection('config')
             .doc('devices')
             .collection('list')
-            .doc(DEVICE_ID)
-            .update({
+            .doc(deviceId)
+            .collection('progress')
+            .doc(action);
+        await progressRef.set({
+            action,
+            progress,
             status,
-            volume: currentVolume
+            currentStep: currentStep || '',
+            timestamp: new Date(),
+            updatedAt: new Date()
         });
+        logger.info({ action, progress, status, currentStep }, '📊 Progress updated');
     }
     catch (error) {
-        logger.error({ error }, 'Heartbeat failed');
+        logger.error({ error }, 'Failed to update progress');
     }
-}, 5000);
-// Initialize with volume 100%
-setTimeout(async () => {
-    await setVolume(100);
-    logger.info('✅ Initial volume set to 100%');
-}, 5000);
-logger.info('✅ Agent initialized');
-    
-    
-    // Robust auto-play with retry mechanism
-    let autoPlayAttempts = 0;
-    const maxAutoPlayAttempts = 10;
-    
-    const tryAutoPlay = async () => {
+}
+async function handleSystemUpdate(deviceId, commandId) {
+    try {
+        logger.info('🔄 Starting system update...');
+        await updateProgress(deviceId, 'update_system', 0, 'starting', 'Initializing');
+        await updateProgress(deviceId, 'update_system', 5, 'running', 'Starting system update');
+        await updateProgress(deviceId, 'update_system', 25, 'running', 'Updating packages');
+        await execAsync('sudo apt update');
+        await updateProgress(deviceId, 'update_system', 35, 'running', 'Package lists updated');
+        await updateProgress(deviceId, 'update_system', 40, 'running', 'Upgrading packages');
+        await execAsync('sudo apt upgrade -y');
+        await updateProgress(deviceId, 'update_system', 60, 'running', 'Packages upgraded');
+        await updateProgress(deviceId, 'update_system', 65, 'running', 'Cleaning up');
+        await execAsync('sudo apt autoremove -y && sudo apt clean');
+        await updateProgress(deviceId, 'update_system', 70, 'running', 'Cleanup complete');
+        await updateProgress(deviceId, 'update_system', 80, 'running', 'Updating code');
         try {
-            autoPlayAttempts++;
-            logger.info({ attempt: autoPlayAttempts }, 'Attempting auto-play...');
-            
-            // Wait for audio device to be ready
-            await execAsync('amixer get PCM').catch(() => {
-                throw new Error('Audio device not ready');
-            });
-            
-            // Get device to find its group
-            const deviceDoc = await firestore
-                .collection('config')
-                .doc('devices')
-                .collection('list')
-                .doc(DEVICE_ID)
-                .get();
-            
-            if (!deviceDoc.exists) {
-                throw new Error('Device not found');
-            }
-            
-            const deviceData = deviceDoc.data();
-            const groupId = deviceData.groupId;
-            
-            if (!groupId) {
-                logger.warn('Device has no group assigned');
-                return;
-            }
-            
-            // Get group streamUrl
-            const groupDoc = await firestore
-                .collection('config')
-                .doc('groups')
-                .collection('list')
-                .doc(groupId)
-                .get();
-            
-            if (groupDoc.exists) {
-                const groupData = groupDoc.data();
-                if (groupData.streamUrl && !isPlaying) {
-                    logger.info({ url: groupData.streamUrl, groupId }, '🎵 Auto-starting music from group');
-                    await play(groupData.streamUrl);
-                    logger.info('✅ Auto-play successful!');
-                    // Start announcement scheduler for this group
-                    startAnnouncementScheduler(groupData);
-                } else {
-                    logger.warn({ groupId }, 'Group has no streamUrl');
-                }
-            } else {
-                logger.warn({ groupId }, 'Group not found');
-            }
-        } catch (error) {
-            logger.error({ 
-                error: error.message || error, 
-                attempt: autoPlayAttempts,
-                maxAttempts: maxAutoPlayAttempts 
-            }, 'Auto-play failed');
-            
-            if (autoPlayAttempts < maxAutoPlayAttempts) {
-                const delay = Math.min(5000 * autoPlayAttempts, 30000);
-                logger.info({ delay, nextAttempt: autoPlayAttempts + 1 }, 'Retrying auto-play...');
-                setTimeout(tryAutoPlay, delay);
-            } else {
-                logger.error('❌ Auto-play failed after max attempts');
-            }
+            await execAsync('cd /home/dietpi/radio-revive/rpi-agent && git pull');
         }
-    };
-    
-    setTimeout(tryAutoPlay, 10000);
-
-
-
-process.on('SIGTERM', () => {
-    logger.info('👋 Shutting down...');
-    unsubscribe();
-    stop();
-    process.exit(0);
-});
+        catch (gitError) {
+            logger.warn({ error: gitError }, 'Git pull failed');
+        }
+        await updateProgress(deviceId, 'update_system', 90, 'running', 'Code updated');
+        await updateProgress(deviceId, 'update_system', 95, 'running', 'Preparing restart');
+        const commandsRef = firestore
+            .collection('config')
+            .doc('devices')
+            .collection('list')
+            .doc(deviceId)
+            .collection('commands');
+        await commandsRef.doc(commandId).update({ processed: true });
+        await updateProgress(deviceId, 'update_system', 100, 'completed', 'Restarting');
+        setTimeout(() => {
+            execAsync('sudo reboot');
+        }, 2000);
+    }
+    catch (error) {
+        logger.error({ error }, '❌ System update failed');
+        await updateProgress(deviceId, 'update_system', 0, 'failed', `Error: ${error}`);
+    }
+}
+async function handleDeviceRestart(deviceId, commandId) {
+    try {
+        logger.info('🔄 Restarting device...');
+        await updateProgress(deviceId, 'restart_device', 0, 'starting', 'Preparing');
+        await updateProgress(deviceId, 'restart_device', 50, 'running', 'Saving state');
+        const commandsRef = firestore
+            .collection('config')
+            .doc('devices')
+            .collection('list')
+            .doc(deviceId)
+            .collection('commands');
+        await commandsRef.doc(commandId).update({ processed: true });
+        await updateProgress(deviceId, 'restart_device', 100, 'completed', 'Restarting now');
+        setTimeout(() => {
+            execAsync('sudo reboot');
+        }, 2000);
+    }
+    catch (error) {
+        logger.error({ error }, '❌ Restart failed');
+        await updateProgress(deviceId, 'restart_device', 0, 'failed', `Error: ${error}`);
+    }
+}
+function listenForFirebaseCommands() {
+    try {
+        const commandsRef = firestore
+            .collection('config')
+            .doc('devices')
+            .collection('list')
+            .doc(deviceId)
+            .collection('commands');
+        commandsRef
+            .where('processed', '==', false)
+            .onSnapshot((snapshot) => {
+            snapshot.docChanges().forEach(async (change) => {
+                if (change.type === 'added') {
+                    const commandData = change.doc.data();
+                    const commandId = change.doc.id;
+                    logger.info({ commandData, commandId }, '📨 Received Firebase command');
+                    try {
+                        if (commandData.action === 'play') {
+                            const urlToPlay = commandData.url || currentUrl;
+                            if (playerProcess && currentUrl === urlToPlay) {
+                                logger.info('Already playing this URL, ignoring duplicate');
+                            }
+                            else {
+                                playStream(urlToPlay);
+                            }
+                        }
+                        else if (commandData.action === 'stop' || commandData.action === 'pause') {
+                            stopStream();
+                        }
+                        else if (commandData.action === 'update_system' || commandData.action === 'update' || commandData.action === 'full_update') {
+                            logger.info('📦 Received system update command');
+                            handleSystemUpdate(deviceId, commandId).catch((error) => {
+                                logger.error({ error }, 'Update failed');
+                            });
+                        }
+                        else if (commandData.action === 'restart_device' || commandData.action === 'restart' || commandData.action === 'reboot') {
+                            logger.info('🔄 Received restart command');
+                            handleDeviceRestart(deviceId, commandId).catch((error) => {
+                                logger.error({ error }, 'Restart failed');
+                            });
+                        }
+                        else if (commandData.action === 'volume' && commandData.volume !== undefined) {
+                            await setVolume(commandData.volume);
+                        }
+                        await commandsRef.doc(commandId).update({ processed: true });
+                        logger.info({ commandId }, '✅ Command processed');
+                    }
+                    catch (error) {
+                        logger.error({ error, commandId }, 'Error processing command');
+                    }
+                }
+            });
+        });
+        logger.info('👂 Listening for Firebase commands...');
+    }
+    catch (error) {
+        logger.error({ error }, 'Error setting up Firebase command listener');
+    }
+}
+function listenForDeviceChanges() {
+    try {
+        const deviceRef = firestore
+            .collection('config')
+            .doc('devices')
+            .collection('list')
+            .doc(deviceId);
+        deviceRef.onSnapshot(async (snapshot) => {
+            if (snapshot.exists) {
+                const deviceData = snapshot.data();
+                if (!hasStartedInitially && deviceData.streamUrl) {
+                    hasStartedInitially = true;
+                    logger.info({ streamUrl: deviceData.streamUrl }, '🎵 Initial start with group stream');
+                    playStream(deviceData.streamUrl);
+                    return;
+                }
+                if (hasStartedInitially && deviceData.streamUrl && deviceData.streamUrl !== currentUrl) {
+                    logger.info({
+                        oldUrl: currentUrl,
+                        newUrl: deviceData.streamUrl
+                    }, '🔄 Stream URL changed, updating playback');
+                    playStream(deviceData.streamUrl);
+                }
+            }
+            else {
+                logger.info('⏳ Waiting for device configuration from Firebase...');
+            }
+        });
+        logger.info('👂 Listening for device changes...');
+    }
+    catch (error) {
+        logger.error({ error }, 'Error setting up device listener');
+    }
+}
+async function bootstrap() {
+    try {
+        logger.info('🚀 Radio Revive Agent starting...');
+        await initializeFirebase();
+        firestore = getFirestore();
+        deviceId = await getDeviceId();
+        logger.info({ deviceId }, '📱 Device ID generated');
+        setInterval(async () => {
+            try {
+                const isPlaying = playerProcess !== null;
+                await updateDeviceHeartbeat(firestore, deviceId, isPlaying, currentUrl);
+            }
+            catch (error) {
+                logger.error({ error }, 'Failed to update heartbeat');
+            }
+        }, 30000);
+        listenForFirebaseCommands();
+        listenForDeviceChanges();
+    }
+    catch (error) {
+        logger.error({ error }, 'Bootstrap failed');
+        process.exit(1);
+    }
+}
+bootstrap();
