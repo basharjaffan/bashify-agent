@@ -380,6 +380,15 @@ function listenForDeviceChanges() {
                     logger.info({ volume: deviceData.volume }, '📢 Applying volume from Firebase');
                     setVolume(deviceData.volume);
                 }
+                // Check if groupId was removed
+                if (!deviceData.groupId && currentGroupData) {
+                    logger.info('⚠️ Device removed from group, stopping playback');
+                    stopStream();
+                    currentGroupData = null;
+                    lastScheduledGroupId = null;
+                    return;
+                }
+                
                 if (deviceData.groupId) {
                     try {
                         const groupRef = firestore
@@ -392,6 +401,17 @@ function listenForDeviceChanges() {
                             const groupData = groupSnapshot.data();
                             currentGroupData = groupData;
                             scheduleAnnouncements(groupData);
+                        } else {
+                            // Group was deleted
+                            logger.info({ groupId: deviceData.groupId }, '⚠️ Group no longer exists, stopping playback');
+                            stopStream();
+                            currentGroupData = null;
+                            
+                            // Clear groupId from device
+                            await deviceRef.update({ 
+                                groupId: null,
+                                streamUrl: null 
+                            });
                         }
                     } catch (error) {
                         logger.error({ error }, 'Failed to fetch group data');
