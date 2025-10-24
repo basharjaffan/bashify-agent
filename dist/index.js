@@ -9,6 +9,13 @@ let playerProcess = null;
 let currentUrl = null;
 let isPlayingLocked = false;
 let hasStartedInitially = false;
+let announcementTimer = null;
+let currentGroupData = null;
+let isPlayingAnnouncement = false;
+let announcementProcess = null;
+let currentVolume = 100;
+let lastScheduledGroupId = null;
+let isPaused = false;
 const startTime = Date.now();
 let firestore;
 let deviceId;
@@ -56,7 +63,15 @@ async function playStream(url) {
     });
     playerProcess.on('spawn', () => {
         logger.info({ pid: playerProcess.pid }, '✅ Music started successfully!');
+        updateDeviceHeartbeat(firestore, deviceId, true, currentUrl).catch(err => logger.error({ err }, 'Failed immediate heartbeat'));
         isPlayingLocked = false;
+        
+        // Återaktivera announcements om vi har groupData
+        if (isPaused && currentGroupData) {
+            isPaused = false;
+            logger.info('▶️ Resuming announcements');
+            scheduleAnnouncements(currentGroupData);
+        }
     });
     playerProcess.on('exit', (code) => {
         logger.warn({ code }, '⏹️ Player stopped');
@@ -65,22 +80,147 @@ async function playStream(url) {
     });
 }
 function stopStream() {
+    isPaused = true;
+    
     if (playerProcess) {
         logger.info({ pid: playerProcess.pid }, '⏹️ Stopping stream...');
         playerProcess.kill('SIGKILL');
         playerProcess = null;
     }
+    
+    // Pausa announcements också
+    if (announcementTimer) {
+        clearInterval(announcementTimer);
+        announcementTimer = null;
+        logger.info('⏸️ Announcements paused');
+    }
+    
+    // Stoppa pågående announcement
+    if (announcementProcess) {
+        announcementProcess.kill('SIGKILL');
+        announcementProcess = null;
+        isPlayingAnnouncement = false;
+        logger.info('⏹️ Stopped current announcement');
+    }
+    
     logger.info('⏹️ Stream stop command sent');
+    updateDeviceHeartbeat(firestore, deviceId, false, null).catch(err => logger.error({ err }, 'Failed immediate heartbeat'));
 }
 async function setVolume(percent) {
-    const rawValue = Math.round((percent / 100) * 400 - 10239);
+    const rawValue = Math.round((percent / 100) * 10639 - 10239);
     try {
-        await execAsync(`amixer set PCM -- ${rawValue}`);
+        await execAsync('amixer set PCM -- ' + rawValue);
+        currentVolume = percent;
+        
+        const deviceRef = firestore
+            .collection('config')
+            .doc('devices')
+            .collection('list')
+            .doc(deviceId);
+        await deviceRef.update({ volume: percent });
+        
         logger.info({ percent, rawValue }, '🔊 Volume updated');
-    }
-    catch (error) {
+    } catch (error) {
         logger.error({ error }, 'Failed to set volume');
     }
+}
+
+async function playAnnouncement(announcementUrl, volumePercent = 100) {
+    if (isPaused) {
+        logger.debug('Skipping announcement - playback is paused');
+        return;
+    }
+    if (isPlayingAnnouncement) {
+        logger.warn('Already playing an announcement');
+        return;
+    }
+    isPlayingAnnouncement = true;
+    const streamWasPaused = playerProcess === null;
+    const previousUrl = currentUrl;
+    try {
+        logger.info({ announcementUrl, volume: volumePercent }, '📢 Playing announcement...');
+        if (playerProcess) {
+            logger.info('⏸️ Pausing music for announcement');
+            playerProcess.kill('SIGKILL');
+            playerProcess = null;
+            await new Promise(resolve => setTimeout(resolve, 300));
+        }
+        announcementProcess = spawn('mpv', [
+            '--no-video',
+            '--audio-device=alsa',
+            '--really-quiet',
+            '--volume=' + volumePercent,
+            announcementUrl
+        ]);
+        announcementProcess.on('error', (error) => {
+            logger.error({ error }, '❌ Announcement playback failed');
+            isPlayingAnnouncement = false;
+            announcementProcess = null;
+            if (previousUrl && !streamWasPaused) {
+                playStream(previousUrl);
+            }
+        });
+        announcementProcess.on('exit', (code) => {
+            logger.info({ code }, '✅ Announcement finished');
+            isPlayingAnnouncement = false;
+            announcementProcess = null;
+            setTimeout(() => {
+                if (previousUrl && !streamWasPaused) {
+                    logger.info('▶️ Resuming music after announcement');
+                    playStream(previousUrl);
+                }
+            }, 500);
+        });
+    } catch (error) {
+        logger.error({ error }, 'Error playing announcement');
+        isPlayingAnnouncement = false;
+        announcementProcess = null;
+        if (previousUrl && !streamWasPaused) {
+            playStream(previousUrl);
+        }
+    }
+}
+
+function scheduleAnnouncements(groupData) {
+    const groupId = groupData.id || JSON.stringify(groupData);
+    if (announcementTimer && lastScheduledGroupId === groupId) {
+        logger.debug('Announcements already scheduled for this group');
+        return;
+    }
+    if (announcementTimer && currentGroupData && JSON.stringify(currentGroupData.announcements) === JSON.stringify(groupData.announcements)) {
+        logger.debug('Announcements already scheduled for this group');
+        return;
+    }
+    if (announcementTimer) {
+        clearInterval(announcementTimer);
+        announcementTimer = null;
+    }
+    if (!groupData.announcements || groupData.announcements.length === 0) {
+        logger.debug('No announcements to schedule');
+        return;
+    }
+    const intervalMinutes = groupData.announcementInterval || 10;
+    const volumePercent = groupData.announcementVolume || 100;
+    const intervalMs = intervalMinutes * 60 * 1000;
+    logger.info({
+        count: groupData.announcements.length,
+        intervalMinutes,
+        volumePercent
+    }, '📢 Scheduling announcements');
+    let currentIndex = 0;
+    setTimeout(() => {
+        if (groupData.announcements[currentIndex]) {
+            playAnnouncement(groupData.announcements[currentIndex].url, volumePercent);
+            currentIndex = (currentIndex + 1) % groupData.announcements.length;
+        }
+    }, 60000);
+    announcementTimer = setInterval(() => {
+        if (groupData.announcements[currentIndex]) {
+            playAnnouncement(groupData.announcements[currentIndex].url, volumePercent);
+            currentIndex = (currentIndex + 1) % groupData.announcements.length;
+        }
+    }, intervalMs);
+    lastScheduledGroupId = groupId;
 }
 async function updateProgress(deviceId, action, progress, status, currentStep) {
     try {
@@ -236,6 +376,27 @@ function listenForDeviceChanges() {
         deviceRef.onSnapshot(async (snapshot) => {
             if (snapshot.exists) {
                 const deviceData = snapshot.data();
+                if (deviceData.volume !== undefined && deviceData.volume !== currentVolume) {
+                    logger.info({ volume: deviceData.volume }, '📢 Applying volume from Firebase');
+                    setVolume(deviceData.volume);
+                }
+                if (deviceData.groupId) {
+                    try {
+                        const groupRef = firestore
+                            .collection('config')
+                            .doc('groups')
+                            .collection('list')
+                            .doc(deviceData.groupId);
+                        const groupSnapshot = await groupRef.get();
+                        if (groupSnapshot.exists) {
+                            const groupData = groupSnapshot.data();
+                            currentGroupData = groupData;
+                            scheduleAnnouncements(groupData);
+                        }
+                    } catch (error) {
+                        logger.error({ error }, 'Failed to fetch group data');
+                    }
+                }
                 if (!hasStartedInitially && deviceData.streamUrl) {
                     hasStartedInitially = true;
                     logger.info({ streamUrl: deviceData.streamUrl }, '🎵 Initial start with group stream');
@@ -267,6 +428,14 @@ async function bootstrap() {
         firestore = getFirestore();
         deviceId = await getDeviceId();
         logger.info({ deviceId }, '📱 Device ID generated');
+        
+        const deviceRefInit = firestore.collection('config').doc('devices').collection('list').doc(deviceId);
+        const deviceDocInit = await deviceRefInit.get();
+        if (deviceDocInit.exists && deviceDocInit.data().volume !== undefined) {
+            currentVolume = deviceDocInit.data().volume;
+            await setVolume(currentVolume);
+            logger.info({ volume: currentVolume }, '🔊 Initial volume set from Firebase');
+        }
         setInterval(async () => {
             try {
                 const isPlaying = playerProcess !== null;
@@ -275,7 +444,7 @@ async function bootstrap() {
             catch (error) {
                 logger.error({ error }, 'Failed to update heartbeat');
             }
-        }, 30000);
+        }, 10000);
         listenForFirebaseCommands();
         listenForDeviceChanges();
     }

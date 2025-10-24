@@ -18,11 +18,6 @@ const startTime = Date.now();
 let firestore: any;
 let deviceId: string;
 
-let announcementTimer: NodeJS.Timeout | null = null;
-let currentGroupData: any = null;
-let isPlayingAnnouncement = false;
-let announcementProcess: ChildProcess | null = null;
-
 async function playStream(url: string) {
   if (isPlayingLocked) {
     logger.warn('Play command ignored - already starting stream');
@@ -209,114 +204,6 @@ async function handleDeviceRestart(deviceId: string, commandId: string) {
   }
 }
 
-async function playAnnouncement(announcementUrl: string, volumePercent: number = 100) {
-  if (isPlayingAnnouncement) {
-    logger.warn('Already playing an announcement');
-    return;
-  }
-
-  isPlayingAnnouncement = true;
-  const streamWasPaused = playerProcess === null;
-  const previousUrl = currentUrl;
-
-  try {
-    logger.info({ announcementUrl, volume: volumePercent }, '📢 Playing announcement...');
-
-    // Pausa musiken om den spelar
-    if (playerProcess) {
-      logger.info('⏸️ Pausing music for announcement');
-      playerProcess.kill('SIGKILL');
-      playerProcess = null;
-      await new Promise(resolve => setTimeout(resolve, 300));
-    }
-
-    // Spela announcement
-    announcementProcess = spawn('mpv', [
-      '--no-video',
-      '--audio-device=alsa',
-      '--really-quiet',
-      `--volume=${volumePercent}`,
-      announcementUrl
-    ]);
-
-    announcementProcess.on('error', (error) => {
-      logger.error({ error }, '❌ Announcement playback failed');
-      isPlayingAnnouncement = false;
-      announcementProcess = null;
-      
-      // Återuppta musik
-      if (previousUrl && !streamWasPaused) {
-        playStream(previousUrl);
-      }
-    });
-
-    announcementProcess.on('exit', (code) => {
-      logger.info({ code }, '✅ Announcement finished');
-      isPlayingAnnouncement = false;
-      announcementProcess = null;
-      
-      // Återuppta musik efter 500ms
-      setTimeout(() => {
-        if (previousUrl && !streamWasPaused) {
-          logger.info('▶️ Resuming music after announcement');
-          playStream(previousUrl);
-        }
-      }, 500);
-    });
-
-  } catch (error) {
-    logger.error({ error }, 'Error playing announcement');
-    isPlayingAnnouncement = false;
-    announcementProcess = null;
-    
-    // Återuppta musik vid fel
-    if (previousUrl && !streamWasPaused) {
-      playStream(previousUrl);
-    }
-  }
-}
-
-function scheduleAnnouncements(groupData: any) {
-  // Rensa tidigare timer
-  if (announcementTimer) {
-    clearInterval(announcementTimer);
-    announcementTimer = null;
-  }
-
-  if (!groupData.announcements || groupData.announcements.length === 0) {
-    logger.debug('No announcements to schedule');
-    return;
-  }
-
-  const intervalMinutes = groupData.announcementInterval || 10;
-  const volumePercent = groupData.announcementVolume || 100;
-  const intervalMs = intervalMinutes * 60 * 1000;
-
-  logger.info({ 
-    count: groupData.announcements.length, 
-    intervalMinutes, 
-    volumePercent 
-  }, '📢 Scheduling announcements');
-
-  let currentIndex = 0;
-
-  // Spela första announcement efter 1 minut
-  setTimeout(() => {
-    if (groupData.announcements[currentIndex]) {
-      playAnnouncement(groupData.announcements[currentIndex].url, volumePercent);
-      currentIndex = (currentIndex + 1) % groupData.announcements.length;
-    }
-  }, 60000); // 1 minut
-
-  // Schemalägg resten
-  announcementTimer = setInterval(() => {
-    if (groupData.announcements[currentIndex]) {
-      playAnnouncement(groupData.announcements[currentIndex].url, volumePercent);
-      currentIndex = (currentIndex + 1) % groupData.announcements.length;
-    }
-  }, intervalMs);
-}
-
 function listenForFirebaseCommands() {
   try {
     const commandsRef = firestore
@@ -387,29 +274,6 @@ function listenForDeviceChanges() {
       if (snapshot.exists) {
         const deviceData = snapshot.data();
 
-        // Hämta gruppinformation om devicen har en groupId
-        if (deviceData.groupId) {
-          try {
-            const groupRef = firestore
-              .collection('config')
-              .doc('groups')
-              .collection('list')
-              .doc(deviceData.groupId);
-            
-            const groupSnapshot = await groupRef.get();
-            
-            if (groupSnapshot.exists) {
-              const groupData = groupSnapshot.data();
-              currentGroupData = groupData;
-              
-              // Schemalägg announcements om gruppen har några
-              scheduleAnnouncements(groupData);
-            }
-          } catch (error) {
-            logger.error({ error }, 'Failed to fetch group data');
-          }
-        }
-
         if (!hasStartedInitially && deviceData.streamUrl) {
           hasStartedInitially = true;
           logger.info({ streamUrl: deviceData.streamUrl }, '🎵 Initial start with group stream');
@@ -435,5 +299,32 @@ function listenForDeviceChanges() {
   }
 }
 
+async function bootstrap() {
+  try {
+    logger.info('🚀 Radio Revive Agent starting...');
+
+    await initializeFirebase();
+    firestore = getFirestore();
+    deviceId = await getDeviceId();
+
+    logger.info({ deviceId }, '📱 Device ID generated');
+
+    setInterval(async () => {
+      try {
+        const isPlaying = playerProcess !== null;
+        await updateDeviceHeartbeat(firestore, deviceId, isPlaying, currentUrl);
+      } catch (error) {
+        logger.error({ error }, 'Failed to update heartbeat');
+      }
+    }, 30000);
+
+    listenForFirebaseCommands();
+    listenForDeviceChanges();
+
+  } catch (error) {
+    logger.error({ error }, 'Bootstrap failed');
+    process.exit(1);
+  }
+}
 
 bootstrap();
