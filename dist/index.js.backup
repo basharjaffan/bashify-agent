@@ -2,191 +2,333 @@ import { initializeApp, cert } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'fs';
 import { logger } from './logger.js';
 import { getDeviceId, updateDeviceHeartbeat } from './config/loader.js';
+
 const execAsync = promisify(exec);
-// Read service account JSON
-const serviceAccount = JSON.parse(readFileSync('/home/dietpi/radio-revive/rpi-agent/service-account.json', 'utf8'));
-initializeApp({
-    credential: cert(serviceAccount),
+
+const MPV_LOCK = '/tmp/bashify-mpv.lock';
+const AGENT_LOCK = '/tmp/bashify-agent.lock';
+
+if (existsSync(AGENT_LOCK)) {
+    const pid = readFileSync(AGENT_LOCK, 'utf8').trim();
+    try {
+        process.kill(parseInt(pid), 0);
+        logger.error({ existingPid: pid }, '❌ Another agent is already running! Exiting.');
+        process.exit(1);
+    } catch {
+        logger.warn('Stale agent lock found, cleaning up');
+        unlinkSync(AGENT_LOCK);
+    }
+}
+
+writeFileSync(AGENT_LOCK, String(process.pid));
+
+process.on('exit', () => {
+    try { unlinkSync(AGENT_LOCK); } catch {}
+    try { unlinkSync(MPV_LOCK); } catch {}
 });
+
+const serviceAccount = JSON.parse(
+    readFileSync('/home/dietpi/radio-revive/rpi-agent/service-account.json', 'utf8')
+);
+
+initializeApp({ credential: cert(serviceAccount) });
 const firestore = getFirestore();
 const DEVICE_ID = getDeviceId();
-logger.info({ deviceId: DEVICE_ID }, '🚀 Radio Revive Agent starting...');
+
+logger.info({ deviceId: DEVICE_ID, pid: process.pid }, '🚀 Agent starting (SINGLETON MODE)');
+
 let currentStreamUrl = null;
 let isPlaying = false;
 let isPaused = false;
-let currentVolume = 100; // Default 100%
-// Music control functions
+let currentVolume = 100;
+let isPlayLocked = false;
+
 async function play(streamUrl) {
+    if (isPlayLocked) {
+        logger.warn('⚠️ Play locked, ignoring duplicate call');
+        return;
+    }
+
     try {
-        await stop();
-        const urlToPlay = streamUrl || currentStreamUrl;
-        if (!urlToPlay) {
-            logger.warn('No stream URL available');
+        isPlayLocked = true;
+        
+        logger.info('🔪 Killing all MPV processes...');
+        await execAsync('pkill -9 mpv').catch(() => {});
+        await new Promise(r => setTimeout(r, 1500));
+        
+        const { stdout: check1 } = await execAsync('pgrep mpv || echo 0').catch(() => ({ stdout: '0' }));
+        if (check1.trim() !== '0') {
+            logger.error('❌ MPV still alive after kill, aborting');
+            isPlayLocked = false;
             return;
         }
+        
+        if (existsSync(MPV_LOCK)) {
+            const lockPid = readFileSync(MPV_LOCK, 'utf8').trim();
+            logger.warn({ lockPid }, 'Found MPV lock, killing process');
+            await execAsync(`kill -9 ${lockPid}`).catch(() => {});
+            unlinkSync(MPV_LOCK);
+        }
+        
+        const urlToPlay = streamUrl || currentStreamUrl;
+        if (!urlToPlay) {
+            logger.warn('No URL to play');
+            isPlayLocked = false;
+            return;
+        }
+        
         currentStreamUrl = urlToPlay;
-        // Set volume to 100% by default or use saved volume
-        const volumeRaw = Math.round((currentVolume / 100) * 65536);
+        
+        const minVol = -10239;
+        const maxVol = 400;
+        const volumeRaw = Math.round(minVol + (currentVolume / 100) * (maxVol - minVol));
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
-        await execAsync(`mpv --no-video --audio-device=alsa --really-quiet "${urlToPlay}" &`);
+        
+        logger.info({ url: urlToPlay }, '▶️ Starting MPV...');
+        const mpvCmd = `nohup mpv --no-video --audio-device=alsa --really-quiet --input-ipc-server=/tmp/mpv-socket "${urlToPlay}" >/dev/null 2>&1 & echo $!`;
+        const { stdout: pidOutput } = await execAsync(mpvCmd);
+        const mpvPid = pidOutput.trim();
+        
+        writeFileSync(MPV_LOCK, mpvPid);
+        logger.info({ mpvPid }, '✅ MPV started with PID');
+        
+        await new Promise(r => setTimeout(r, 2000));
+        const { stdout: countCheck } = await execAsync('pgrep mpv | wc -l');
+        const mpvCount = parseInt(countCheck.trim());
+        
+        if (mpvCount === 0) {
+            logger.error('❌ MPV failed to start');
+            isPlayLocked = false;
+            return;
+        }
+        
+        if (mpvCount > 1) {
+            logger.error({ count: mpvCount }, '🚨 MULTIPLE MPV DETECTED! Killing all...');
+            await execAsync('pkill -9 mpv');
+            unlinkSync(MPV_LOCK);
+            isPlayLocked = false;
+            return;
+        }
+        
         isPlaying = true;
         isPaused = false;
+        
+        await firestore.collection('config').doc('devices').collection('list').doc(DEVICE_ID)
+            .update({ 
+                status: 'playing', 
+                isPlaying: true, 
+                currentUrl: urlToPlay 
+            });
+        
         await updateDeviceHeartbeat(firestore, DEVICE_ID, true, urlToPlay);
-        logger.info({ streamUrl: urlToPlay, volume: currentVolume }, '▶️ Music started');
-    }
-    catch (error) {
-        logger.error({ error }, 'Failed to start music');
-    }
-}
-async function pause() {
-    try {
-        await execAsync('killall -STOP mpv');
-        isPaused = true;
-        isPlaying = false;
-        await firestore
-            .collection('config')
-            .doc('devices')
-            .collection('list')
-            .doc(DEVICE_ID)
-            .update({ status: 'paused' });
-        logger.info('⏸️ Music paused');
-    }
-    catch (error) {
-        logger.error({ error }, 'Failed to pause');
+        
+        logger.info({ mpvCount }, '✅ Play successful');
+        
+    } catch (error) {
+        logger.error({ error: String(error) }, '❌ Play failed');
+    } finally {
+        isPlayLocked = false;
     }
 }
-async function resume() {
-    try {
-        await execAsync('killall -CONT mpv');
-        isPaused = false;
-        isPlaying = true;
-        await updateDeviceHeartbeat(firestore, DEVICE_ID, true, currentStreamUrl || '');
-        logger.info('▶️ Music resumed');
-    }
-    catch (error) {
-        logger.error({ error }, 'Failed to resume');
-    }
-}
+
 async function stop() {
     try {
-        await execAsync('killall mpv');
+        logger.info('⏹️ Stopping music...');
+        await execAsync('pkill -9 mpv').catch(() => {});
+        await new Promise(r => setTimeout(r, 1000));
+        
+        if (existsSync(MPV_LOCK)) unlinkSync(MPV_LOCK);
+        
         isPlaying = false;
         isPaused = false;
-        await firestore
-            .collection('config')
-            .doc('devices')
-            .collection('list')
-            .doc(DEVICE_ID)
-            .update({ status: 'online' });
-        logger.info('⏹️ Music stopped');
-    }
-    catch (error) {
-        // Ignore if mpv not running
+        currentStreamUrl = '';
+        
+        await firestore.collection('config').doc('devices').collection('list').doc(DEVICE_ID)
+            .update({ 
+                status: 'stopped', 
+                isPlaying: false,
+                currentUrl: ''
+            });
+        
+        logger.info('✅ Stopped');
+    } catch (error) {
+        logger.error({ error }, 'Stop failed');
     }
 }
+
+async function pause() {
+    try {
+        logger.info('⏸️ Pausing music...');
+        await execAsync('pkill -STOP mpv');
+        isPaused = true;
+        isPlaying = false;
+        
+        await firestore.collection('config').doc('devices').collection('list').doc(DEVICE_ID)
+            .update({ 
+                status: 'paused', 
+                isPlaying: false 
+            });
+        
+        logger.info('✅ Paused');
+    } catch (error) {
+        logger.error({ error }, 'Pause failed');
+    }
+}
+
+async function resume() {
+    try {
+        logger.info('▶️ Resuming music...');
+        await execAsync('pkill -CONT mpv');
+        isPaused = false;
+        isPlaying = true;
+        
+        await firestore.collection('config').doc('devices').collection('list').doc(DEVICE_ID)
+            .update({ 
+                status: 'playing', 
+                isPlaying: true,
+                currentUrl: currentStreamUrl 
+            });
+        
+        await updateDeviceHeartbeat(firestore, DEVICE_ID, true, currentStreamUrl || '');
+        
+        logger.info('✅ Resumed');
+    } catch (error) {
+        logger.error({ error }, 'Resume failed');
+    }
+}
+
 async function setVolume(volumePercent) {
     try {
+        logger.info({ requested: volumePercent }, '🔊 Setting volume...');
         currentVolume = Math.max(0, Math.min(100, volumePercent));
-        const volumeRaw = Math.round((currentVolume / 100) * 65536);
+        const minVol = -10239;
+        const maxVol = 400;
+        const volumeRaw = Math.round(minVol + (currentVolume / 100) * (maxVol - minVol));
         await execAsync(`amixer set PCM -- ${volumeRaw}`);
-        await firestore
-            .collection('config')
-            .doc('devices')
-            .collection('list')
-            .doc(DEVICE_ID)
+        
+        await firestore.collection('config').doc('devices').collection('list').doc(DEVICE_ID)
             .update({ volume: currentVolume });
-        logger.info({ volume: currentVolume }, '🔊 Volume updated');
-    }
-    catch (error) {
-        logger.error({ error }, 'Failed to set volume');
+        
+        logger.info({ volume: currentVolume }, '✅ Volume set');
+    } catch (error) {
+        logger.error({ error }, 'Volume failed');
     }
 }
-// Listen for commands
-const commandsRef = firestore
-    .collection('config')
-    .doc('commands')
-    .collection('list');
-const unsubscribe = commandsRef.where('deviceId', '==', DEVICE_ID).onSnapshot(async (snapshot) => {
+
+// Command listener
+const commandsRef = firestore.collection('config').doc('commands').collection('list');
+commandsRef.where('deviceId', '==', DEVICE_ID).onSnapshot(async (snapshot) => {
     for (const change of snapshot.docChanges()) {
         if (change.type === 'added') {
-            const commandData = change.doc.data();
-            if (commandData.processed)
-                continue;
-            logger.info({ command: commandData }, '📨 Command received');
+            const cmd = change.doc.data();
+            if (cmd.processed) continue;
+
+            logger.info({ command: cmd.action, data: cmd }, '📨 Command received');
+
             try {
-                switch (commandData.action) {
+                switch (cmd.action) {
                     case 'play':
-                        await play(commandData.streamUrl);
+                        if (isPaused) {
+                            logger.info('Resuming from pause');
+                            await resume();
+                        } else {
+                            logger.info('Starting new playback');
+                            await play(cmd.streamUrl);
+                        }
                         break;
                     case 'pause':
-                        if (isPaused) {
-                            await resume();
-                        }
-                        else {
+                        if (!isPaused && isPlaying) {
                             await pause();
+                        } else {
+                            logger.info('Already paused or not playing');
                         }
                         break;
                     case 'stop':
                         await stop();
                         break;
                     case 'volume':
-                        await setVolume(commandData.volume || 100);
+                        await setVolume(cmd.volume || 100);
                         break;
                     case 'system_update':
                         logger.info('🔄 System update requested');
                         exec('bash /home/dietpi/radio-revive/rpi-agent/scripts/system-update.sh');
                         break;
-                    case 'configure_wifi':
-                    case 'network_config':
-                        logger.info({ ip: commandData.ipAddress, gateway: commandData.gateway }, '🌐 Network config requested');
-                        exec(`sudo bash /home/dietpi/radio-revive/rpi-agent/scripts/configure-network.sh "${commandData.ipAddress}" "${commandData.gateway}" "${commandData.dns1}" "${commandData.dns2}" "${commandData.interface || 'eth0'}"`);
-                        break;
-                        logger.info({ ssid: commandData.ssid }, '📶 WiFi config requested');
-                        exec(`bash /home/dietpi/radio-revive/rpi-agent/scripts/configure-wifi.sh "${commandData.ssid}" "${commandData.password}"`);
-                        break;
                 }
+
                 await commandsRef.doc(change.doc.id).update({ processed: true });
-            }
-            catch (error) {
-                logger.error({ error }, 'Command execution failed');
+                logger.info({ commandId: change.doc.id }, '✅ Command processed');
+            } catch (error) {
+                logger.error({ error, commandId: change.doc.id }, 'Command failed');
             }
         }
     }
-}, (error) => {
-    logger.error({ error }, 'Commands listener error');
 });
-// Heartbeat every 10 seconds
+
+// Heartbeat
 setInterval(async () => {
     try {
         const status = isPaused ? 'paused' : isPlaying ? 'playing' : 'online';
         await updateDeviceHeartbeat(firestore, DEVICE_ID, isPlaying, currentStreamUrl || '');
-        // Update with current status and volume
-        await firestore
-            .collection('config')
-            .doc('devices')
-            .collection('list')
-            .doc(DEVICE_ID)
-            .update({
-            status,
-            volume: currentVolume
-        });
-    }
-    catch (error) {
+        await firestore.collection('config').doc('devices').collection('list').doc(DEVICE_ID)
+            .update({ 
+                status, 
+                volume: currentVolume,
+                isPlaying: isPlaying,
+                isPaused: isPaused
+            });
+    } catch (error) {
         logger.error({ error }, 'Heartbeat failed');
     }
-}, 10000);
-// Initialize with volume 100%
+}, 5000);
+
+// Init volume
 setTimeout(async () => {
     await setVolume(100);
-    logger.info('✅ Initial volume set to 100%');
+    logger.info('✅ Volume initialized to 100%');
 }, 5000);
-logger.info('✅ Agent initialized');
-process.on('SIGTERM', () => {
-    logger.info('👋 Shutting down...');
-    unsubscribe();
-    stop();
-    process.exit(0);
-});
+
+// Auto-play
+let autoPlayAttempts = 0;
+const tryAutoPlay = async () => {
+    try {
+        autoPlayAttempts++;
+        logger.info({ attempt: autoPlayAttempts }, '🎵 Auto-play attempt');
+
+        const deviceDoc = await firestore.collection('config').doc('devices').collection('list').doc(DEVICE_ID).get();
+        if (!deviceDoc.exists) throw new Error('Device not found');
+
+        const { groupId } = deviceDoc.data();
+        if (!groupId) {
+            logger.warn('No group assigned, skipping auto-play');
+            return;
+        }
+
+        const groupDoc = await firestore.collection('config').doc('groups').collection('list').doc(groupId).get();
+        if (!groupDoc.exists) throw new Error('Group not found');
+
+        const { streamUrl } = groupDoc.data();
+        if (streamUrl && !isPlaying && !isPaused) {
+            logger.info({ url: streamUrl, groupId }, '🎵 Auto-starting music');
+            await play(streamUrl);
+            logger.info('✅ Auto-play successful!');
+        } else {
+            logger.info({ isPlaying, isPaused }, 'Skipping auto-play - already playing or paused');
+        }
+    } catch (error) {
+        logger.error({ error: error.message, attempt: autoPlayAttempts }, 'Auto-play failed');
+        if (autoPlayAttempts < 10) {
+            const delay = Math.min(5000 * autoPlayAttempts, 30000);
+            logger.info({ delay, nextAttempt: autoPlayAttempts + 1 }, 'Retrying auto-play...');
+            setTimeout(tryAutoPlay, delay);
+        } else {
+            logger.error('❌ Auto-play failed after max attempts');
+        }
+    }
+};
+
+setTimeout(tryAutoPlay, 10000);
+
+logger.info('✅ Agent initialized and ready');
