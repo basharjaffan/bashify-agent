@@ -13,6 +13,8 @@ let announcementTimer = null;
 let currentGroupData = null;
 let isPlayingAnnouncement = false;
 let announcementProcess = null;
+let wasPlayingBeforeAnnouncement = false;
+let savedUrlBeforePause = null;
 let currentVolume = 100;
 let lastScheduledGroupId = null;
 let isPaused = false;
@@ -105,13 +107,43 @@ async function playStream(url) {
         }
     });
 }
+
+function resumeStream() {
+    if (playerProcess && isPaused) {
+        logger.info({ pid: playerProcess.pid }, '▶️ Resuming stream (SIGCONT)...');
+        try {
+            playerProcess.kill('SIGCONT');
+            isPaused = false;
+            savedUrlBeforePause = null;
+        } catch (err) {
+            logger.error('Could not resume with SIGCONT');
+            playerProcess = null;
+            if (savedUrlBeforePause) {
+                playStream(savedUrlBeforePause);
+            }
+        }
+    } else if (savedUrlBeforePause) {
+        logger.info('No paused process, restarting from saved URL');
+        isPaused = false;
+        playStream(savedUrlBeforePause);
+        savedUrlBeforePause = null;
+    }
+}
+
 function stopStream() {
     isPaused = true;
+    savedUrlBeforePause = currentUrl;
+    logger.info({ savedUrl: savedUrlBeforePause }, '💾 Saving URL before pause');
     
     if (playerProcess) {
-        logger.info({ pid: playerProcess.pid }, '⏹️ Stopping stream...');
-        playerProcess.kill('SIGKILL');
-        playerProcess = null;
+        logger.info({ pid: playerProcess.pid }, '⏸️ Pausing stream (SIGSTOP)...');
+        try {
+            playerProcess.kill('SIGSTOP');
+        } catch (err) {
+            logger.warn('Could not pause with SIGSTOP, killing instead');
+            playerProcess.kill('SIGKILL');
+            playerProcess = null;
+        }
     }
     
     // Pausa announcements också
@@ -166,9 +198,16 @@ async function playAnnouncement(announcementUrl, volumePercent = 100) {
     try {
         logger.info({ announcementUrl, volume: volumePercent }, '📢 Playing announcement...');
         if (playerProcess) {
-            logger.info('⏸️ Pausing music for announcement');
-            playerProcess.kill('SIGKILL');
-            playerProcess = null;
+            logger.info('⏸️ Pausing music for announcement (SIGSTOP)');
+            wasPlayingBeforeAnnouncement = true;
+            try {
+                playerProcess.kill('SIGSTOP');
+            } catch (err) {
+                logger.warn('Could not pause with SIGSTOP, killing instead');
+                playerProcess.kill('SIGKILL');
+                playerProcess = null;
+                wasPlayingBeforeAnnouncement = false;
+            }
             await new Promise(resolve => setTimeout(resolve, 300));
         }
         announcementProcess = spawn('mpv', [
@@ -191,8 +230,19 @@ async function playAnnouncement(announcementUrl, volumePercent = 100) {
             isPlayingAnnouncement = false;
             announcementProcess = null;
             setTimeout(() => {
-                if (previousUrl && !streamWasPaused) {
-                    logger.info('▶️ Resuming music after announcement');
+                if (wasPlayingBeforeAnnouncement && playerProcess) {
+                    logger.info('▶️ Resuming music after announcement (SIGCONT)');
+                    try {
+                        playerProcess.kill('SIGCONT');
+                        wasPlayingBeforeAnnouncement = false;
+                    } catch (err) {
+                        logger.warn('Could not resume with SIGCONT, restarting');
+                        if (previousUrl && !streamWasPaused) {
+                            playStream(previousUrl);
+                        }
+                    }
+                } else if (previousUrl && !streamWasPaused) {
+                    logger.info('▶️ Restarting music after announcement');
                     playStream(previousUrl);
                 }
             }, 500);
@@ -350,8 +400,12 @@ function listenForFirebaseCommands() {
                     const commandId = change.doc.id;
                     logger.info({ commandData, commandId }, '📨 Received Firebase command');
                     try {
-                        if (commandData.action === 'play') {
-                            const urlToPlay = commandData.url || currentUrl;
+                        if (commandData.action === 'play' || commandData.action === 'resume') {
+                        if (isPaused && (playerProcess || savedUrlBeforePause)) {
+                            logger.info('Resuming paused playback');
+                            resumeStream();
+                        } else {
+                            const urlToPlay = commandData.url || commandData.streamUrl || currentUrl;
                             if (playerProcess && currentUrl === urlToPlay) {
                                 logger.info('Already playing this URL, ignoring duplicate');
                             }
@@ -359,7 +413,8 @@ function listenForFirebaseCommands() {
                                 playStream(urlToPlay);
                             }
                         }
-                        else if (commandData.action === 'stop' || commandData.action === 'pause') {
+                    }
+                    else if (commandData.action === 'stop' || commandData.action === 'pause') {
                             stopStream();
                         }
                         else if (commandData.action === 'update_system' || commandData.action === 'update' || commandData.action === 'full_update') {
