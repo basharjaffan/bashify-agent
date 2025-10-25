@@ -74,9 +74,35 @@ async function playStream(url) {
         }
     });
     playerProcess.on('exit', (code) => {
-        logger.warn({ code }, '⏹️ Player stopped');
-        playerProcess = null;
-        isPlayingLocked = false;
+        if (code === 0 && !isPaused && currentGroupData && currentGroupData.localFiles && currentGroupData.localFiles.length > 0) {
+            const tracks = currentGroupData.localFiles;
+            const getFilename = (url) => decodeURIComponent(url.split('/').pop().split('?')[0]);
+            const currentFile = getFilename(currentUrl);
+            const currentIndex = tracks.findIndex(t => getFilename(t.url) === currentFile);
+            
+            if (currentIndex >= 0) {
+                const nextIndex = (currentIndex + 1) % tracks.length;
+                const nextTrack = tracks[nextIndex];
+                logger.info({ finished: currentIndex + 1, next: nextIndex + 1, total: tracks.length }, '⏭️ Next track');
+                playerProcess = null;
+                isPlayingLocked = false;
+                setTimeout(() => { if (!isPaused) playStream(nextTrack.url); }, 500);
+            } else {
+                logger.warn('Track not found, looping same');
+                playerProcess = null;
+                isPlayingLocked = false;
+                setTimeout(() => { if (!isPaused && currentUrl) playStream(currentUrl); }, 500);
+            }
+        } else if (code === 0 && !isPaused && currentUrl) {
+            logger.info('Looping track');
+            playerProcess = null;
+            isPlayingLocked = false;
+            setTimeout(() => { if (!isPaused) playStream(currentUrl); }, 500);
+        } else {
+            logger.warn({ code }, '⏹️ Player stopped');
+            playerProcess = null;
+            isPlayingLocked = false;
+        }
     });
 }
 function stopStream() {
@@ -376,6 +402,16 @@ function listenForDeviceChanges() {
         deviceRef.onSnapshot(async (snapshot) => {
             if (snapshot.exists) {
                 const deviceData = snapshot.data();
+                
+                // FIRST: Check if device has no group - stop everything
+                if (!deviceData.groupId) {
+                    if (playerProcess || currentGroupData) {
+                        logger.info('⚠️ Device has no group, stopping playback');
+                        stopStream();
+                        currentGroupData = null;
+                    }
+                    return;
+                }
                 if (deviceData.volume !== undefined && deviceData.volume !== currentVolume) {
                     logger.info({ volume: deviceData.volume }, '📢 Applying volume from Firebase');
                     setVolume(deviceData.volume);
@@ -424,11 +460,16 @@ function listenForDeviceChanges() {
                     return;
                 }
                 if (hasStartedInitially && deviceData.streamUrl && deviceData.streamUrl !== currentUrl) {
-                    logger.info({
-                        oldUrl: currentUrl,
-                        newUrl: deviceData.streamUrl
-                    }, '🔄 Stream URL changed, updating playback');
-                    playStream(deviceData.streamUrl);
+                    // Don't interrupt playlist mode
+                    if (currentGroupData && currentGroupData.localFiles && currentGroupData.localFiles.length > 1) {
+                        logger.debug('Ignoring streamUrl change - in playlist mode');
+                    } else {
+                        logger.info({
+                            oldUrl: currentUrl,
+                            newUrl: deviceData.streamUrl
+                        }, '🔄 Stream URL changed, updating playback');
+                        playStream(deviceData.streamUrl);
+                    }
                 }
             }
             else {
